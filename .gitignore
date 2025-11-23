@@ -209,7 +209,7 @@ __marimo__/
 dev-notes.md
 
 # Local data (not pushed to GitHub)
-data/raw/
-data/processed/
+Datas/raw/
+Datas/processed/
 
 

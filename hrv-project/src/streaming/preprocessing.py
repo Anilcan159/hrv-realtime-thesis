@@ -8,7 +8,15 @@ import pandas as pd
 # Root paths
 # __file__ = .../hrv-project/src/streaming/preprocessing.py
 BASE_DIR = Path(__file__).resolve().parents[2]  # -> .../hrv-project
-RAW_DATA_DIR = BASE_DIR / "data" / "raw" / "rr-interval-healthy-subjects-1.0.0"
+RAW_DATA_DIR = (
+    BASE_DIR
+    / "Datas"
+    / "raw"
+    / "physionet.org"
+    / "files"
+    / "rr-interval-healthy-subjects"
+    / "1.0.0"
+)
 PROCESSED_DIR = BASE_DIR / "data" / "processed" / "rr_clean"
 
 
@@ -28,12 +36,24 @@ def clean_rr_values(
     rr_max: int = 2000,
 ) -> pd.DataFrame:
     """
-    Basic RR cleaning: keep only values in [rr_min, rr_max] ms.
+    Basic RR cleaning: convert to numeric and keep only values in [rr_min, rr_max] ms.
     """
     df = df.copy()
+
+    # 1) Her ihtimale karşı rr_ms sütununu sayıya çevir
+    df["rr_ms"] = pd.to_numeric(df["rr_ms"], errors="coerce")
+
+    # 2) Sayıya çevrilemeyenleri at (NaN olanlar)
+    df = df.dropna(subset=["rr_ms"])
+
+    # 3) Fiziksel aralığa göre filtrele
     df = df[(df["rr_ms"] >= rr_min) & (df["rr_ms"] <= rr_max)]
-    df = df.dropna().reset_index(drop=True)
+
+    # 4) Index'i sıfırla
+    df = df.reset_index(drop=True)
+
     return df
+
 
 
 def add_time_and_hr(df: pd.DataFrame, subject_id: str) -> pd.DataFrame:
@@ -68,6 +88,7 @@ def process_single_subject(subject_id: str) -> None:
 def process_all_subjects() -> None:
     """
     Loops over all txt files in RAW_DATA_DIR and processes each one.
+    Skips non-numeric filenames like LICENSE.txt.
     """
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -75,9 +96,16 @@ def process_all_subjects() -> None:
     print(f"Found {len(txt_files)} raw txt files.")
 
     for f in txt_files:
-        subject_id = f.stem  # "001", "002", ...
+        subject_id = f.stem  # "000", "401", "LICENSE", ...
+
+        # Sadece tamamen rakamlardan oluşan ID'leri işle
+        if not subject_id.isdigit():
+            print(f"Skipping non-subject file: {f.name}")
+            continue
+
         print(f"Processing subject {subject_id} ...")
         process_single_subject(subject_id)
+
 
 
 if __name__ == "__main__":
