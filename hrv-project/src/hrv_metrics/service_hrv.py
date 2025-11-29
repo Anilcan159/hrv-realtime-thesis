@@ -8,7 +8,7 @@ import pandas as pd
 
 # Proje kökü: .../hrv-project
 ROOT_DIR = Path(__file__).parents[2]
-PATIENT_INFO_PATH = Path(__file__).parents[2] / "Datas" / "processed" / "raw" / "patient-info.csv"
+PATIENT_INFO_PATH = ROOT_DIR / "Datas" / "processed" / "patient-info.csv"
 
 # RR dosyalarının olduğu klasör:
 # hrv-project/data/processed/rr_clean
@@ -209,38 +209,47 @@ def get_poincare_data(subject_code: str, max_points: int = 1000) -> dict:
 
 def get_subject_info(subject_code: str) -> dict:
     """
-    Returns demographic info for a subject: age / sex / group (child/adult/older).
-    Uses patient-info.csv with columns: code;age;sex
+    Demografik bilgiler: age / sex / group (child/adult/older).
+
+    CSV formatını esnek okur:
+    - İlk satır "code;age;sex" veya "File;age;sex" olabilir (header).
+    - Ya da hiç header olmayıp direkt "0;53;M" ile başlayabilir.
+    - İlk kolon bazen "File" bazen "code" olabilir.
     """
-    # 1) CSV'yi oku
+
+    # 1) CSV'yi oku (header varmış/yokmuş gibi düşünmeden)
     try:
         df = pd.read_csv(
             PATIENT_INFO_PATH,
-            sep=";",      # ; ile ayrılmış
-            header=0      # ilk satır header: code;age;sex
+            sep=";",              # ; ile ayrılmış
+            header=None,          # header olduğunu varsaymıyoruz
+            names=["code", "age", "sex"],
         )
     except FileNotFoundError:
         return {"code": subject_code, "age": None, "sex": None, "group": None}
 
-    # 2) Kolon adını normalize et (eski versiyonda "File" olabilir)
-    if "code" not in df.columns and "File" in df.columns:
-        df = df.rename(columns={"File": "code"})
-
-    # Güvenlik: yine de code/age/sex yoksa boş dön
-    for col in ["code", "age", "sex"]:
-        if col not in df.columns:
-            return {"code": subject_code, "age": None, "sex": None, "group": None}
-
-    # 3) subject_code'u ve code kolonunu karşılaştırmak için string'e çevir
+    # 2) Eğer ilk satır aslında header ise (code/File yazıyorsa) onu at
     df["code"] = df["code"].astype(str)
+    mask_header = df["code"].str.lower().isin(["code", "file"])
+    df = df[~mask_header]
 
+    if df.empty:
+        return {"code": subject_code, "age": None, "sex": None, "group": None}
+
+    # 3) code kolonunu sayıya çevir (0, 2, 401 vs.)
+    df["code"] = pd.to_numeric(df["code"], errors="coerce")
+
+    # subject_code -> int (örn. "000" -> 0)
     try:
-        # "000" -> "0", "401" -> "401"
-        target_code = str(int(subject_code))
+        code_int = int(subject_code)
     except ValueError:
-        target_code = str(subject_code)
+        code_int = None
 
-    row = df[df["code"] == target_code]
+    if code_int is not None:
+        row = df[df["code"] == code_int]
+    else:
+        # Sayıya çevrilemiyorsa fallback string karşılaştırma
+        row = df[df["code"].astype(str) == str(subject_code)]
 
     if row.empty:
         return {"code": subject_code, "age": None, "sex": None, "group": None}
@@ -248,7 +257,7 @@ def get_subject_info(subject_code: str) -> dict:
     age = row.iloc[0]["age"]
     sex = row.iloc[0]["sex"]
 
-    # 4) Yaşa göre grup (sadece sayıya çevrilebilenler için)
+    # 4) Yaşa göre grup (sadece gerçekten sayıysa)
     try:
         age_val = float(age)
     except (TypeError, ValueError):
@@ -264,4 +273,6 @@ def get_subject_info(subject_code: str) -> dict:
         group = "Older adult"
 
     return {"code": subject_code, "age": age, "sex": sex, "group": group}
+
+
 
