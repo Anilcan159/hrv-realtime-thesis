@@ -12,6 +12,26 @@ ROOT_DIR = Path(__file__).parents[2]
 # hrv-project/data/processed/rr_clean
 RR_DIR = ROOT_DIR / "data" / "processed" / "rr_clean"
 
+def get_available_subject_codes():
+    """
+    rr_clean klasöründeki *_clean.csv dosyalarından subject_code listesini üretir.
+    Örn: 000_clean.csv -> '000'
+    """
+    codes = []
+    for path in RR_DIR.glob("*_clean.csv"):
+        code = path.stem.replace("_clean", "")
+        codes.append(code)
+
+    # sayısal sıraya göre sırala (000,002,003,005,401,...)
+    def _sort_key(c):
+        try:
+            return int(c)
+        except ValueError:
+            return 999999  # numara olmayanları sona at
+
+    codes = sorted(codes, key=_sort_key)
+    return codes
+
 
 # -------------------- RR KAYNAĞI -------------------- #
 
@@ -94,6 +114,31 @@ def _compute_time_domain_from_rr(rr: np.ndarray) -> dict:
         "hr_min": hr_min,
     }
 
+def get_hr_timeseries(subject_code: str, max_points: int = 500):
+    """
+    Belirli bir denek için RR serisinden HR (bpm) zaman serisi üretir.
+    - RR saniye cinsinden.
+    - Zaman ekseni: kümülatif RR (gerçek geçen süre).
+    """
+    rr = load_rr_from_csv(subject_code)  # zaten var olan fonksiyon
+
+    if rr.size < 1:
+        return [], []
+
+    # Zaman ekseni: rr'lerin kümülatif toplamı (saniye)
+    t_sec = np.cumsum(rr)
+
+    # Kalp hızı: bpm
+    hr_bpm = 60.0 / rr
+
+    # Çok uzun serileri ekran için kısalt (son max_points örnek)
+    if t_sec.size > max_points:
+        t_sec = t_sec[-max_points:]
+        hr_bpm = hr_bpm[-max_points:]
+
+    return t_sec, hr_bpm
+
+
 
 def get_time_domain_metrics(subject_code: str = "000") -> dict:
     """
@@ -105,3 +150,56 @@ def get_time_domain_metrics(subject_code: str = "000") -> dict:
     rr = load_rr_from_csv(subject_code)
     td = _compute_time_domain_from_rr(rr)
     return td
+
+def get_poincare_data(subject_code: str, max_points: int = 1000) -> dict:
+    """
+    Poincaré diyagramı için:
+    - RR_n ve RR_{n+1} (ms cinsinden)
+    - SD1, SD2, SD1/SD2 oranı ve basit bir stress index döner.
+    """
+    rr = load_rr_from_csv(subject_code)  # saniye cinsinden RR
+
+    if rr.size < 3:
+        return {
+            "x": [],
+            "y": [],
+            "sd1": float("nan"),
+            "sd2": float("nan"),
+            "sd1_sd2_ratio": float("nan"),
+            "stress_index": float("nan"),
+        }
+
+    # ms'e çevir
+    rr_ms = rr * 1000.0
+
+    # Poincaré noktaları: RR_n (x), RR_{n+1} (y)
+    x = rr_ms[:-1]
+    y = rr_ms[1:]
+
+    # Çok uzun serilerde son max_points noktayı al
+    if x.size > max_points:
+        x = x[-max_points:]
+        y = y[-max_points:]
+
+    # SD1 / SD2 hesapları (Task Force formülleri)
+    sdnn = float(np.std(rr_ms, ddof=1))              # tüm RR'nin std'si (ms)
+    diff_ms = np.diff(rr_ms)                         # ardışık farklar
+    var_diff = float(np.var(diff_ms, ddof=1))
+
+    sd1 = float(np.sqrt(0.5 * var_diff))            # sd1
+    # içi negatif olmasın diye max(..., 0.0)
+    sd2_inside = 2.0 * (sdnn ** 2) - 0.5 * var_diff
+    sd2 = float(np.sqrt(max(sd2_inside, 0.0)))      # sd2
+
+    sd1_sd2_ratio = float(sd1 / sd2) if sd2 > 0 else float("nan")
+    # Şimdilik basit bir numerik stress index: SD2/SD1
+    stress_index = float(sd2 / sd1) if sd1 > 0 else float("nan")
+
+    return {
+        "x": x.tolist(),
+        "y": y.tolist(),
+        "sd1": sd1,
+        "sd2": sd2,
+        "sd1_sd2_ratio": sd1_sd2_ratio,
+        "stress_index": stress_index,
+    }

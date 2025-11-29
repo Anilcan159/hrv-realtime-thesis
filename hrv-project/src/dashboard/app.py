@@ -7,19 +7,25 @@ SRC_DIR = os.path.dirname(CURRENT_DIR)
 if SRC_DIR not in sys.path:
     sys.path.append(SRC_DIR)
 
-from dash import Dash, html, dcc
+from dash import Dash, html, dcc, Input, Output
 import plotly.graph_objects as go
 import math
 
-from hrv_metrics.service_hrv import get_time_domain_metrics
-
+from hrv_metrics.service_hrv import (
+    get_time_domain_metrics,
+    get_available_subject_codes,
+    get_hr_timeseries,
+    get_poincare_data,         
+)
 app = Dash(__name__)
+# ----------------- GLOBAL DEGISKENLER ----------------- #
+subject_codes = get_available_subject_codes()
 
-metrics = get_time_domain_metrics("000")
+
 
 # ----------------- DUMMY VERI (sadece layout görmek için) ----------------- #
-time_points = list(range(60))  # 60 saniyelik örnek aks
-hr_values = [70 + 5 * math.sin(t / 5) for t in time_points]  # bpm
+
+time_points = list(range(60))
 
 lf_values = [500 + 80 * math.sin(t / 10) for t in time_points]
 hf_values = [400 + 60 * math.cos(t / 8) for t in time_points]
@@ -36,22 +42,7 @@ rr_n = rr_series[:-1]
 rr_n1 = rr_series[1:]
 
 # ----------------- PLOTLY FIGURE'LERI ----------------- #
-# HR line chart
-hr_fig = go.Figure()
-hr_fig.add_trace(
-    go.Scatter(
-        x=time_points,
-        y=hr_values,
-        mode="lines",
-        name="HR (bpm)",
-    )
-)
-hr_fig.update_layout(
-    margin=dict(l=20, r=20, t=30, b=30),
-    template="plotly_dark",
-    xaxis_title="Time (s)",
-    yaxis_title="Heart Rate (bpm)",
-)
+
 
 # LF/HF line chart
 lfhf_fig = go.Figure()
@@ -133,6 +124,9 @@ def metric_card(title: str, value: str, unit: str = ""):
 
 
 # ----------------- APP LAYOUT ----------------- #
+# layout'tan ÖNCE bir yerde:
+subject_codes = get_available_subject_codes()
+
 app.layout = html.Div(
     style={
         "backgroundColor": "#131F39",
@@ -142,7 +136,7 @@ app.layout = html.Div(
         "fontFamily": "Arial, sans-serif",
     },
     children=[
-        # ÜST BAŞLIK + DROPDOWN
+        # ---------------- ÜST BAŞLIK + DROPDOWN ---------------- #
         html.Div(
             style={
                 "display": "flex",
@@ -173,11 +167,11 @@ app.layout = html.Div(
                         dcc.Dropdown(
                             id="subject-dropdown",
                             options=[
-                                {"label": "Subject 001 - Rest", "value": "sub001_rest"},
-                                {"label": "Subject 001 - Stress test", "value": "sub001_stress"},
-                                {"label": "Subject 002 - Rest", "value": "sub002_rest"},
+                                {"label": f"Subject {code}", "value": code}
+                                for code in subject_codes
                             ],
-                            value="sub001_rest",
+                            value=subject_codes[0] if subject_codes else None,
+                            clearable=False,
                             style={"color": "#000000"},
                         ),
                     ],
@@ -185,7 +179,7 @@ app.layout = html.Div(
             ],
         ),
 
-        # ORTA BÖLÜM: 3 SÜTUN
+        # ---------------- ORTA BÖLÜM: 3 SÜTUN ---------------- #
         html.Div(
             style={
                 "display": "grid",
@@ -194,7 +188,7 @@ app.layout = html.Div(
                 "marginBottom": "20px",
             },
             children=[
-                # ---------------- SOL SÜTUN: TIME-DOMAIN + HR LINE ---------------- #
+                # SOL SÜTUN: TIME-DOMAIN + HR
                 html.Div(
                     style={
                         "backgroundColor": "#131F39",
@@ -211,22 +205,17 @@ app.layout = html.Div(
                             "Short-term HRV indices computed over recent window",
                             style={"fontSize": "12px", "color": "#A0AEC0"},
                         ),
-                        # 2x3 grid metric kartları
+
+                        # 2x3 metric kartları
                         html.Div(
+                            id="metrics-grid",
                             style={
                                 "display": "grid",
                                 "gridTemplateColumns": "repeat(3, 1fr)",
                                 "gridGap": "10px",
                                 "marginTop": "5px",
                             },
-                            children=[
-                                metric_card("SDNN", f"{metrics['sdnn']:.1f}", "ms"),
-                                metric_card("RMSSD", f"{metrics['rmssd']:.1f}", "ms"),
-                                metric_card("pNN50", f"{metrics['pnn50']:.1f}", "%"),
-                                metric_card("Mean HR", f"{metrics['mean_hr']:.1f}", "bpm"),
-                                metric_card("HR max", f"{metrics['hr_max']:.1f}", "bpm"),
-                                metric_card("HR min", f"{metrics['hr_min']:.1f}", "bpm"),
-                            ],
+                            children=[],
                         ),
 
                         # HR çizgi grafiği
@@ -239,7 +228,6 @@ app.layout = html.Div(
                                 ),
                                 dcc.Graph(
                                     id="hr-graph",
-                                    figure=hr_fig,
                                     style={"height": "260px"},
                                 ),
                             ],
@@ -247,7 +235,7 @@ app.layout = html.Div(
                     ],
                 ),
 
-                # ---------------- ORTA SÜTUN: FREQUENCY-DOMAIN ---------------- #
+                # ORTA SÜTUN: FREQUENCY-DOMAIN
                 html.Div(
                     style={
                         "backgroundColor": "#131F39",
@@ -277,7 +265,7 @@ app.layout = html.Div(
                     ],
                 ),
 
-                # ---------------- SAĞ SÜTUN: POINCARÉ + INDEX ---------------- #
+                # SAĞ SÜTUN: POINCARÉ + NON-LINEAR
                 html.Div(
                     style={
                         "backgroundColor": "#131F39",
@@ -296,28 +284,23 @@ app.layout = html.Div(
                         ),
                         dcc.Graph(
                             id="poincare-graph",
-                            figure=poincare_fig,
                             style={"height": "260px"},
                         ),
                         html.Div(
+                            id="poincare-metrics",
                             style={
                                 "display": "grid",
                                 "gridTemplateColumns": "repeat(2, 1fr)",
                                 "gridGap": "10px",
                             },
-                            children=[
-                                metric_card("SD1", "24", "ms"),
-                                metric_card("SD2", "55", "ms"),
-                                metric_card("SD1/SD2 ratio", "0.44", ""),
-                                metric_card("Stress index", "Normal", ""),
-                            ],
+                            children=[],
                         ),
                     ],
                 ),
             ],
         ),
 
-        # ALT STATUS BAR
+        # ---------------- ALT STATUS BAR ---------------- #
         html.Div(
             style={
                 "backgroundColor": "#223459",
@@ -330,10 +313,7 @@ app.layout = html.Div(
             children=[
                 html.Div(
                     children=[
-                        html.Span(
-                            "Status: ",
-                            style={"fontWeight": "bold"},
-                        ),
+                        html.Span("Status: ", style={"fontWeight": "bold"}),
                         html.Span("Normal (no alerts detected in the last window)"),
                     ]
                 ),
@@ -345,6 +325,102 @@ app.layout = html.Div(
         ),
     ],
 )
+
+# ---------------- CALLBACKS ---------------- #
+
+@app.callback(
+    Output("metrics-grid", "children"),
+    Input("subject-dropdown", "value"),
+)
+def update_metrics_grid(subject_code):
+    metrics = get_time_domain_metrics(subject_code)
+    cards = [
+        metric_card("SDNN", f"{metrics['sdnn']:.1f}", "ms"),
+        metric_card("RMSSD", f"{metrics['rmssd']:.1f}", "ms"),
+        metric_card("pNN50", f"{metrics['pnn50']:.1f}", "%"),
+        metric_card("Mean HR", f"{metrics['mean_hr']:.1f}", "bpm"),
+        metric_card("HR max", f"{metrics['hr_max']:.1f}", "bpm"),
+        metric_card("HR min", f"{metrics['hr_min']:.1f}", "bpm"),
+    ]
+    return cards
+
+
+@app.callback(
+    Output("hr-graph", "figure"),
+    Input("subject-dropdown", "value"),
+)
+def update_hr_graph(subject_code):
+    t_sec, hr_bpm = get_hr_timeseries(subject_code)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=t_sec,
+            y=hr_bpm,
+            mode="lines",
+            name="Heart Rate",
+        )
+    )
+
+    fig.update_layout(
+        title="Heart rate over time",
+        xaxis_title="Time (s)",
+        yaxis_title="Heart Rate (bpm)",
+        template="plotly_dark",
+        margin=dict(l=40, r=20, t=40, b=40),
+        height=260,
+    )
+    return fig
+
+
+@app.callback(
+    Output("poincare-graph", "figure"),
+    Input("subject-dropdown", "value"),
+)
+def update_poincare_graph(subject_code):
+    data = get_poincare_data(subject_code)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=data["x"],
+            y=data["y"],
+            mode="markers",
+            marker=dict(size=4, opacity=0.6),
+            name="RRn vs RRn+1",
+        )
+    )
+
+    fig.update_layout(
+        title="Poincaré plot (RRn vs RRn+1)",
+        xaxis_title="RRₙ (ms)",
+        yaxis_title="RRₙ₊₁ (ms)",
+        template="plotly_dark",
+        margin=dict(l=40, r=20, t=40, b=40),
+        height=260,
+    )
+    return fig
+
+
+@app.callback(
+    Output("poincare-metrics", "children"),
+    Input("subject-dropdown", "value"),
+)
+def update_poincare_metrics(subject_code):
+    data = get_poincare_data(subject_code)
+
+    sd1 = data["sd1"]
+    sd2 = data["sd2"]
+    ratio = data["sd1_sd2_ratio"]
+    stress = data["stress_index"]
+
+    cards = [
+        metric_card("SD1", f"{sd1:.1f}", "ms"),
+        metric_card("SD2", f"{sd2:.1f}", "ms"),
+        metric_card("SD1/SD2 ratio", f"{ratio:.2f}", ""),
+        metric_card("Stress index", f"{stress:.2f}", ""),
+    ]
+    return cards
 
 
 if __name__ == "__main__":
