@@ -15,8 +15,10 @@ from hrv_metrics.service_hrv import (
     get_time_domain_metrics,
     get_available_subject_codes,
     get_hr_timeseries,
-    get_poincare_data,         
+    get_poincare_data,
+    get_subject_info,          # 👈 BUNU EKLE
 )
+
 app = Dash(__name__)
 # ----------------- GLOBAL DEGISKENLER ----------------- #
 subject_codes = get_available_subject_codes()
@@ -158,7 +160,7 @@ app.layout = html.Div(
                     ]
                 ),
                 html.Div(
-                    style={"minWidth": "220px"},
+                    style={"minWidth": "260px"},
                     children=[
                         html.Label(
                             "Subject / Session",
@@ -173,6 +175,15 @@ app.layout = html.Div(
                             value=subject_codes[0] if subject_codes else None,
                             clearable=False,
                             style={"color": "#000000"},
+                        ),
+                        html.Div(
+                            id="subject-info",
+                            style={
+                                "fontSize": "11px",
+                                "color": "#A0AEC0",
+                                "marginTop": "6px",
+                                "lineHeight": "1.4",
+                            },
                         ),
                     ],
                 ),
@@ -205,8 +216,6 @@ app.layout = html.Div(
                             "Short-term HRV indices computed over recent window",
                             style={"fontSize": "12px", "color": "#A0AEC0"},
                         ),
-
-                        # 2x3 metric kartları
                         html.Div(
                             id="metrics-grid",
                             style={
@@ -217,8 +226,6 @@ app.layout = html.Div(
                             },
                             children=[],
                         ),
-
-                        # HR çizgi grafiği
                         html.Div(
                             style={"marginTop": "10px"},
                             children=[
@@ -325,7 +332,6 @@ app.layout = html.Div(
         ),
     ],
 )
-
 # ---------------- CALLBACKS ---------------- #
 
 @app.callback(
@@ -421,6 +427,45 @@ def update_poincare_metrics(subject_code):
         metric_card("Stress index", f"{stress:.2f}", ""),
     ]
     return cards
+
+
+@app.callback(
+    Output("subject-info", "children"),
+    Input("subject-dropdown", "value"),
+)
+def update_subject_info(subject_code):
+    """
+    Seçilen subject için yaş / cinsiyet / grup bilgisini gösterir.
+    """
+    info = get_subject_info(subject_code)
+
+    age = info.get("age")
+    sex = info.get("sex")
+    group = info.get("group")
+
+    # Age formatla (NaN / None durumlarına karşı)
+    if age is None:
+        age_str = "Unknown"
+    elif isinstance(age, float) and age != age:  # NaN kontrolü
+        age_str = "Unknown"
+    else:
+        # 53.0 -> 53
+        if isinstance(age, (int, float)):
+            age_str = str(int(age))
+        else:
+            age_str = str(age)
+
+    sex_str = "-" if sex in (None, "", float("nan")) else str(sex)
+    group_str = "" if group in (None, "") else f" · Group: {group}"
+
+    return [
+        html.Span(
+            f"Subject {info['code']}",
+            style={"fontWeight": "bold"},
+        ),
+        html.Br(),
+        html.Span(f"Age: {age_str} · Sex: {sex_str}{group_str}"),
+    ]
 
 
 if __name__ == "__main__":

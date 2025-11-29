@@ -1,12 +1,14 @@
 # src/hrv_metrics/service_hrv.py
 
 from pathlib import Path
+import json
 import numpy as np
 import pandas as pd
 
 
 # Proje kökü: .../hrv-project
 ROOT_DIR = Path(__file__).parents[2]
+PATIENT_INFO_PATH = Path(__file__).parents[2] / "Datas" / "processed" / "raw" / "patient-info.csv"
 
 # RR dosyalarının olduğu klasör:
 # hrv-project/data/processed/rr_clean
@@ -203,3 +205,55 @@ def get_poincare_data(subject_code: str, max_points: int = 1000) -> dict:
         "sd1_sd2_ratio": sd1_sd2_ratio,
         "stress_index": stress_index,
     }
+
+
+def get_subject_info(subject_code: str) -> dict:
+    """
+    Demografik bilgiler: age / sex / group (child/adult/older).
+    patient-info.csv dosyasının kabaca: code;age;sex yapısında olduğunu varsayarız.
+    """
+    # subject_code "006" -> 6
+    try:
+        code_int = int(subject_code)
+    except ValueError:
+        return {"code": subject_code, "age": None, "sex": None, "group": None}
+
+    # patient-info.csv'yi oku
+    try:
+        df = pd.read_csv(PATIENT_INFO_PATH, sep=";")
+    except FileNotFoundError:
+        return {"code": subject_code, "age": None, "sex": None, "group": None}
+
+    # Eğer header yoksa ve kolon adları bulunamazsa fallback:
+    if "code" not in df.columns:
+        df = pd.read_csv(
+            PATIENT_INFO_PATH,
+            sep=";",
+            header=None,
+            names=["code", "age", "sex"],
+        )
+
+    row = df[df["code"] == code_int]
+    if row.empty:
+        return {"code": subject_code, "age": None, "sex": None, "group": None}
+
+    age = row.iloc[0]["age"]
+    sex = row.iloc[0]["sex"]
+
+    # Yaşa göre basit grup
+    try:
+        age_val = float(age)
+    except (TypeError, ValueError):
+        age_val = None
+
+    if age_val is None:
+        group = None
+    elif age_val < 18:
+        group = "Child / adolescent"
+    elif age_val < 65:
+        group = "Adult"
+    else:
+        group = "Older adult"
+
+    return {"code": subject_code, "age": age, "sex": sex, "group": group}
+
