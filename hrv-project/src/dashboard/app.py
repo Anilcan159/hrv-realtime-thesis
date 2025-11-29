@@ -1,8 +1,21 @@
+import os
+import sys
+
+CURRENT_DIR = os.path.dirname(__file__)
+SRC_DIR = os.path.dirname(CURRENT_DIR)
+
+if SRC_DIR not in sys.path:
+    sys.path.append(SRC_DIR)
+
 from dash import Dash, html, dcc
 import plotly.graph_objects as go
 import math
 
+from hrv_metrics.service_hrv import get_time_domain_metrics
+
 app = Dash(__name__)
+
+metrics = get_time_domain_metrics("000")
 
 # ----------------- DUMMY VERI (sadece layout görmek için) ----------------- #
 time_points = list(range(60))  # 60 saniyelik örnek aks
@@ -207,14 +220,15 @@ app.layout = html.Div(
                                 "marginTop": "5px",
                             },
                             children=[
-                                metric_card("SDNN", "42", "ms"),
-                                metric_card("RMSSD", "35", "ms"),
-                                metric_card("pNN50", "18", "%"),
-                                metric_card("Mean HR", "72", "bpm"),
-                                metric_card("HR max", "88", "bpm"),
-                                metric_card("HR min", "61", "bpm"),
+                                metric_card("SDNN", f"{metrics['sdnn']:.1f}", "ms"),
+                                metric_card("RMSSD", f"{metrics['rmssd']:.1f}", "ms"),
+                                metric_card("pNN50", f"{metrics['pnn50']:.1f}", "%"),
+                                metric_card("Mean HR", f"{metrics['mean_hr']:.1f}", "bpm"),
+                                metric_card("HR max", f"{metrics['hr_max']:.1f}", "bpm"),
+                                metric_card("HR min", f"{metrics['hr_min']:.1f}", "bpm"),
                             ],
                         ),
+
                         # HR çizgi grafiği
                         html.Div(
                             style={"marginTop": "10px"},
