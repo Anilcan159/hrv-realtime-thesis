@@ -209,37 +209,46 @@ def get_poincare_data(subject_code: str, max_points: int = 1000) -> dict:
 
 def get_subject_info(subject_code: str) -> dict:
     """
-    Demografik bilgiler: age / sex / group (child/adult/older).
-    patient-info.csv dosyasının:
-        1. kolon -> code
-        2. kolon -> age
-        3. kolon -> sex
-    olduğunu varsayar.
+    Returns demographic info for a subject: age / sex / group (child/adult/older).
+    Uses patient-info.csv with columns: code;age;sex
     """
+    # 1) CSV'yi oku
     try:
-        code_int = int(subject_code)
-    except ValueError:
-        return {"code": subject_code, "age": None, "sex": None, "group": None}
-
-    try:
-        # Header olsa bile önemli değil; biz kolon isimlerini kendimiz veriyoruz.
         df = pd.read_csv(
             PATIENT_INFO_PATH,
-            sep=";",
-            header=None,
-            names=["code", "age", "sex"],
+            sep=";",      # ; ile ayrılmış
+            header=0      # ilk satır header: code;age;sex
         )
     except FileNotFoundError:
         return {"code": subject_code, "age": None, "sex": None, "group": None}
 
-    row = df[df["code"] == code_int]
+    # 2) Kolon adını normalize et (eski versiyonda "File" olabilir)
+    if "code" not in df.columns and "File" in df.columns:
+        df = df.rename(columns={"File": "code"})
+
+    # Güvenlik: yine de code/age/sex yoksa boş dön
+    for col in ["code", "age", "sex"]:
+        if col not in df.columns:
+            return {"code": subject_code, "age": None, "sex": None, "group": None}
+
+    # 3) subject_code'u ve code kolonunu karşılaştırmak için string'e çevir
+    df["code"] = df["code"].astype(str)
+
+    try:
+        # "000" -> "0", "401" -> "401"
+        target_code = str(int(subject_code))
+    except ValueError:
+        target_code = str(subject_code)
+
+    row = df[df["code"] == target_code]
+
     if row.empty:
         return {"code": subject_code, "age": None, "sex": None, "group": None}
 
     age = row.iloc[0]["age"]
     sex = row.iloc[0]["sex"]
 
-    # Yaşa göre basit grup
+    # 4) Yaşa göre grup (sadece sayıya çevrilebilenler için)
     try:
         age_val = float(age)
     except (TypeError, ValueError):
@@ -251,7 +260,6 @@ def get_subject_info(subject_code: str) -> dict:
         group = "Child / adolescent"
     elif age_val < 65:
         group = "Adult"
-        # 65+ için
     else:
         group = "Older adult"
 
