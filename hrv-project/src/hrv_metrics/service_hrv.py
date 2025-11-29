@@ -210,28 +210,27 @@ def get_poincare_data(subject_code: str, max_points: int = 1000) -> dict:
 def get_subject_info(subject_code: str) -> dict:
     """
     Demografik bilgiler: age / sex / group (child/adult/older).
-    patient-info.csv dosyasının kabaca: code;age;sex yapısında olduğunu varsayarız.
+    patient-info.csv dosyasının:
+        1. kolon -> code
+        2. kolon -> age
+        3. kolon -> sex
+    olduğunu varsayar.
     """
-    # subject_code "006" -> 6
     try:
         code_int = int(subject_code)
     except ValueError:
         return {"code": subject_code, "age": None, "sex": None, "group": None}
 
-    # patient-info.csv'yi oku
     try:
-        df = pd.read_csv(PATIENT_INFO_PATH, sep=";")
-    except FileNotFoundError:
-        return {"code": subject_code, "age": None, "sex": None, "group": None}
-
-    # Eğer header yoksa ve kolon adları bulunamazsa fallback:
-    if "code" not in df.columns:
+        # Header olsa bile önemli değil; biz kolon isimlerini kendimiz veriyoruz.
         df = pd.read_csv(
             PATIENT_INFO_PATH,
             sep=";",
             header=None,
             names=["code", "age", "sex"],
         )
+    except FileNotFoundError:
+        return {"code": subject_code, "age": None, "sex": None, "group": None}
 
     row = df[df["code"] == code_int]
     if row.empty:
@@ -252,6 +251,7 @@ def get_subject_info(subject_code: str) -> dict:
         group = "Child / adolescent"
     elif age_val < 65:
         group = "Adult"
+        # 65+ için
     else:
         group = "Older adult"
 
