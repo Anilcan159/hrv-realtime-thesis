@@ -16,8 +16,10 @@ from hrv_metrics.service_hrv import (
     get_available_subject_codes,
     get_hr_timeseries,
     get_poincare_data,
-    get_subject_info,          # 👈 BUNU EKLE
+    get_subject_info,
+    get_freq_domain_metrics,
 )
+
 
 app = Dash(__name__)
 # ----------------- GLOBAL DEGISKENLER ----------------- #
@@ -261,14 +263,13 @@ app.layout = html.Div(
                         ),
                         dcc.Graph(
                             id="lf-hf-graph",
-                            figure=lfhf_fig,
                             style={"height": "230px"},
                         ),
                         dcc.Graph(
                             id="band-pie-graph",
-                            figure=pie_fig,
                             style={"height": "220px"},
                         ),
+
                     ],
                 ),
 
@@ -332,6 +333,8 @@ app.layout = html.Div(
         ),
     ],
 )
+
+
 # ---------------- CALLBACKS ---------------- #
 
 @app.callback(
@@ -377,6 +380,100 @@ def update_hr_graph(subject_code):
         height=260,
     )
     return fig
+
+@app.callback(
+    Output("lf-hf-graph", "figure"),
+    Output("band-pie-graph", "figure"),
+    Input("subject-dropdown", "value"),
+)
+def update_frequency_domain_graphs(subject_code):
+    # 1) Backend'den frekans domeni metriklerini çek
+    fd = get_freq_domain_metrics(subject_code)
+
+    freq = fd.get("freq", [])
+    psd = fd.get("psd", [])
+    band_powers = fd.get("band_powers", {})
+
+    # Eğer veri yoksa boş figür dön
+    if not freq or not psd:
+        empty_fig = go.Figure()
+        empty_fig.update_layout(
+            template="plotly_dark",
+            margin=dict(l=40, r=20, t=40, b=40),
+        )
+        return empty_fig, empty_fig
+
+    # 2) LF ve HF bantlarını ayır (Hz cinsinden)
+    lf_low, lf_high = 0.04, 0.15
+    hf_low, hf_high = 0.15, 0.40
+
+    lf_freq, lf_psd = [], []
+    hf_freq, hf_psd = [], []
+
+    for f, p in zip(freq, psd):
+        if lf_low <= f < lf_high:
+            lf_freq.append(f)
+            lf_psd.append(p)
+        elif hf_low <= f < hf_high:
+            hf_freq.append(f)
+            hf_psd.append(p)
+
+    # 3) Line chart: LF ve HF spektrumu
+    lfhf_fig = go.Figure()
+    if lf_freq:
+        lfhf_fig.add_trace(
+            go.Scatter(
+                x=lf_freq,
+                y=lf_psd,
+                mode="lines",
+                name="LF",
+            )
+        )
+    if hf_freq:
+        lfhf_fig.add_trace(
+            go.Scatter(
+                x=hf_freq,
+                y=hf_psd,
+                mode="lines",
+                name="HF",
+            )
+        )
+
+    lfhf_fig.update_layout(
+        title="LF / HF power spectrum",
+        xaxis_title="Frequency (Hz)",
+        yaxis_title="Power (a.u.)",
+        template="plotly_dark",
+        margin=dict(l=40, r=20, t=40, b=40),
+        height=230,
+        legend=dict(orientation="h", y=-0.2),
+    )
+
+    # 4) Pie chart: VLF / LF / HF band güçleri
+    labels = ["VLF", "LF", "HF"]
+    values = [
+        band_powers.get("VLF", 0.0),
+        band_powers.get("LF", 0.0),
+        band_powers.get("HF", 0.0),
+    ]
+
+    pie_fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.3,
+            )
+        ]
+    )
+    pie_fig.update_layout(
+        title="VLF / LF / HF power distribution",
+        template="plotly_dark",
+        margin=dict(l=20, r=20, t=30, b=30),
+        height=220,
+    )
+
+    return lfhf_fig, pie_fig
 
 
 @app.callback(

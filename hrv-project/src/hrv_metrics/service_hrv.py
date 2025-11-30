@@ -4,7 +4,8 @@ from pathlib import Path
 import json
 import numpy as np
 import pandas as pd
-
+from scipy.interpolate import CubicSpline
+from scipy.signal import welch
 
 # Proje kökü: .../hrv-project
 ROOT_DIR = Path(__file__).parents[2]
@@ -116,6 +117,76 @@ def _compute_time_domain_from_rr(rr: np.ndarray) -> dict:
         "hr_min": hr_min,
     }
 
+# -------------------- FREQUENCY-DOMAIN HESAP -------------------- #
+
+# Computes VLF / LF / HF band powers from RR series (seconds)
+def _compute_freq_domain_from_rr(rr: np.ndarray, fs_resample: float = 4.0) -> dict:
+    """
+    RR serisini (saniye cinsinden) zaman eksenine yerleştirip
+    sabit örneklemeli bir sinyale (4 Hz) yeniden örnekler,
+    ardından Welch yöntemi ile PSD hesaplayıp VLF / LF / HF güçlerini döner.
+    """
+    rr = np.asarray(rr, dtype=float)
+
+    if rr.ndim != 1 or rr.size < 4:
+        raise ValueError("RR series must be 1D and contain at least 4 samples")
+
+    # 1) Zaman ekseni: kümülatif RR (saniye)
+    t = np.cumsum(rr)
+    t = t - t[0]  # 0'dan başlat
+
+    # 2) Uniform zaman ekseni (örneğin 4 Hz)
+    if t[-1] <= 0:
+        raise ValueError("Total duration must be positive")
+
+    dt = 1.0 / fs_resample
+    t_uniform = np.arange(0.0, t[-1], dt)
+
+    if t_uniform.size < 8:
+        raise ValueError("Not enough duration for frequency analysis")
+
+    # 3) RR sinyalini uniform eksene spline ile yeniden örnekle
+    spline = CubicSpline(t, rr)
+    rr_interp = spline(t_uniform)
+
+    # 4) Trend'i kaldır (ortalama çıkar)
+    rr_detrended = rr_interp - np.mean(rr_interp)
+
+    # 5) Welch ile PSD
+    nperseg = min(256, rr_detrended.size)
+    f, Pxx = welch(rr_detrended, fs=fs_resample, nperseg=nperseg)
+
+    # 6) Bant güçleri
+    bands = {
+        "VLF": (0.0033, 0.04),
+        "LF":  (0.04, 0.15),
+        "HF":  (0.15, 0.40),
+    }
+
+    band_powers = {}
+    for name, (low, high) in bands.items():
+        mask = (f >= low) & (f < high)
+        if np.any(mask):
+            band_powers[name] = float(np.trapz(Pxx[mask], f[mask]))
+        else:
+            band_powers[name] = 0.0
+
+    lf_power = band_powers.get("LF", 0.0)
+    hf_power = band_powers.get("HF", 0.0)
+    lf_hf_ratio = float(lf_power / hf_power) if hf_power > 0 else float("nan")
+
+    # İleride Dash grafikleri için lazım olabilecek her şeyi döndürüyoruz
+    return {
+        "freq": f.tolist(),          # frekans ekseni (Hz)
+        "psd": Pxx.tolist(),         # PSD değerleri
+        "band_powers": band_powers,  # dict: VLF/LF/HF
+        "lf_hf_ratio": lf_hf_ratio,
+    }
+
+
+
+
+
 def get_hr_timeseries(subject_code: str, max_points: int = 500):
     """
     Belirli bir denek için RR serisinden HR (bpm) zaman serisi üretir.
@@ -152,6 +223,27 @@ def get_time_domain_metrics(subject_code: str = "000") -> dict:
     rr = load_rr_from_csv(subject_code)
     td = _compute_time_domain_from_rr(rr)
     return td
+
+def get_time_domain_metrics(subject_code: str = "000") -> dict:
+    """
+    Dashboard tarafından kullanılan ana fonksiyon.
+    ...
+    """
+    rr = load_rr_from_csv(subject_code)
+    td = _compute_time_domain_from_rr(rr)
+    return td
+
+
+def get_freq_domain_metrics(subject_code: str = "000", fs_resample: float = 4.0) -> dict:
+    """
+    Dashboard tarafından kullanılan frekans domeni fonksiyonu.
+    - Belirli bir subject_code için RR verisini okur,
+    - VLF / LF / HF band güçlerini ve LF/HF oranını hesaplar.
+    """
+    rr = load_rr_from_csv(subject_code)
+    fd = _compute_freq_domain_from_rr(rr, fs_resample=fs_resample)
+    return fd
+
 
 def get_poincare_data(subject_code: str, max_points: int = 1000) -> dict:
     """
