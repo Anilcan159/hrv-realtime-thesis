@@ -1,15 +1,12 @@
 # src/streaming/preprocessing.py
-# Converts raw PhysioNet RR txt files into per-subject CLEAN CSV files.
-# Bilimsel arka plan:
-# - RR < 300 ms veya > 2000 ms genellikle artefakt / ektopik olarak kabul edilir. [Vest et al., 2018]
-# - |RRn - RRn-1| > ~200 ms veya >%20 fark içeren atımlar sık kullanılan eşiklerden biridir.
-#   (Clifford 2006, Vest 2018; özet: PhysioNet toolbox artefact rules)
+# Offline preprocessing:
+#   - Raw PhysioNet RR txt -> cleaned per-subject CSV
+#   - Fizyolojik filtre + güvenli interpolasyon + zaman / HR hesapları
 
 from pathlib import Path
-from typing import Tuple, Dict
-
 import numpy as np
 import pandas as pd
+
 
 # Root paths
 # __file__ = .../hrv-project/src/streaming/preprocessing.py
@@ -26,311 +23,213 @@ RAW_DATA_DIR = (
 PROCESSED_DIR = BASE_DIR / "data" / "processed" / "rr_clean"
 
 
-# ---------------------------------------------------------------------
-# 1) RR SERISINI YUKLE
-# ---------------------------------------------------------------------
 def load_rr_series(subject_id: str) -> pd.DataFrame:
     """
-    Ham RR serisini (ms) DataFrame olarak yükler.
-    RAW_DATA_DIR içinde '001.txt' gibi dosya beklenir.
+    Raw RR serisini (ms) tek sütunlu DataFrame olarak yükler.
+    Örn: RAW_DATA_DIR / '000.txt' -> rr_ms kolonu.
 
-    Çıktı:
-        df_raw: tek kolonlu DataFrame, kolon adı 'rr_ms'
+    Her satır bir RR interval (ms).
     """
     file_path = RAW_DATA_DIR / f"{subject_id}.txt"
     df = pd.read_csv(file_path, header=None, names=["rr_ms"])
     return df
 
 
-# ---------------------------------------------------------------------
-# 2) ARTEFAKT TESPITI
-# ---------------------------------------------------------------------
-def detect_rr_artifacts(
+# -------------------- YARDIMCI: FİZYOLOJİK FİLTRE -------------------- #
+
+def _mark_outliers_physio(
+    rr_ms: pd.Series,
+    rr_min: int = 300,
+    rr_max: int = 2000,
+) -> pd.Series:
+    """
+    Fizyolojik sınırlar dışındaki RR değerlerini NaN yapar.
+
+    - rr_min, rr_max ms cinsindendir.
+    - 300–2000 ms bandı Task Force ve pratik HRV çalışmalarında yaygın kullanılan
+      bir kaba aralıktır (çok hızlı / çok yavaş veya artefakt atımlar elenir).
+    """
+    rr = pd.to_numeric(rr_ms, errors="coerce").astype(float)
+
+    # Fiziksel aralık dışında kalanları NaN yap
+    mask_out = (rr < rr_min) | (rr > rr_max)
+    rr[mask_out] = np.nan
+
+    return rr
+
+
+# -------------------- YARDIMCI: KISA BOŞLUKLARI DOLDUR -------------------- #
+
+def _interpolate_short_gaps(
     rr_ms: np.ndarray,
-    rr_min_ms: int = 300,
-    rr_max_ms: int = 2000,
-    max_abs_diff_ms: int = 200,
-    max_rel_diff: float = 0.20,
+    max_gap_beats: int = 3,
 ) -> np.ndarray:
     """
-    RR serisinde artefakt / şüpheli atımları işaretler.
+    RR (ms) dizisinde NaN olan KISA boşlukları güvenli şekilde doldurur.
 
-    Kullanılan kurallar (literatürde yaygın pratiklere dayanır):
-      1) Fiziksel sınırlar:
-         - RR < rr_min_ms  (≈ HR > 200 bpm)
-         - RR > rr_max_ms  (≈ HR < 30 bpm)
+    Mantık:
+      - max_gap_beats uzunluğa kadar olan NaN blokları:
+          * Mümkünse sol ve sağ komşu değerler arasında LINEER interpolasyon.
+          * Sadece tek tarafta değer varsa forward / backward fill.
+      - max_gap_beats'ten UZUN bloklar:
+          * Olduğu gibi NaN bırakılır (güvenilmez segmentler).
+      - En sonda kalan NaN'lar (uzun bloklar) tamamen DROPlanır.
 
-      2) Ardışık mutlak fark:
-         - |RR_n - RR_{n-1}| > max_abs_diff_ms
-
-      3) Göreli fark:
-         - |RR_n - RR_{n-1}| / RR_{n-1} > max_rel_diff  (örn. > %20 değişim)
-
-    Parametreler:
-        rr_ms          : RR intervalleri (ms)
-        rr_min_ms      : minimum kabul edilebilir RR (ms)
-        rr_max_ms      : maksimum kabul edilebilir RR (ms)
-        max_abs_diff_ms: ardışık RR farkı için mutlak eşik (ms)
-        max_rel_diff   : ardışık RR farkı için göreli eşik (0.20 = %20)
-
-    Döner:
-        is_artifact: bool array, True olan indexler artefakt / şüpheli atım.
+    Bu, eski defterde kullandığın "kısa boşlukları düzelt, uzunları kullanma"
+    fikrinin sade ve deterministik bir implementasyonudur.
     """
-    rr = np.asarray(rr_ms, dtype=float)
+    rr = np.asarray(rr_ms, dtype=float).copy()
     n = rr.size
 
     if n == 0:
-        return np.array([], dtype=bool)
-
-    # Başlangıç: NaN / inf ve fiziksel aralık dışında kalanlar
-    is_artifact = ~np.isfinite(rr)
-    is_artifact |= (rr < rr_min_ms) | (rr > rr_max_ms)
-
-    if n > 1:
-        diff = np.abs(np.diff(rr))
-        rel_diff = diff / np.maximum(rr[:-1], 1e-6)
-
-        big_abs_jump = diff > max_abs_diff_ms
-        big_rel_jump = rel_diff > max_rel_diff
-
-        # Bu sıçramayı hem yeni beat'e hem gerekirse önceki beat'e atfedebiliriz.
-        # Burada sade olması için sadece "yeni" atımı işaretliyoruz.
-        jump_mask = big_abs_jump | big_rel_jump
-        is_artifact[1:] |= jump_mask
-
-    return is_artifact
-
-
-# ---------------------------------------------------------------------
-# 3) ARTEFAKT DUZELTME (REMOVE / INTERPOLATE)
-# ---------------------------------------------------------------------
-def correct_rr_artifacts(
-    rr_ms: np.ndarray,
-    is_artifact: np.ndarray,
-    method: str = "interpolate",
-) -> np.ndarray:
-    """
-    Artefakt olarak işaretlenen RR değerlerini düzeltir.
-
-    method:
-        - "remove"      : artefakt beat'leri tamamen çıkarır
-        - "interpolate" : artefakt beat'lerin değerini komşu düzgün beat'ler
-                          arasında lineer interpolasyon ile doldurur
-        - "none"        : hiçbir düzeltme yapmaz, rr_ms'i aynen döner
-
-    Döner:
-        rr_clean_ms: temizlenmiş RR serisi (ms)
-    """
-    rr = np.asarray(rr_ms, dtype=float)
-    is_artifact = np.asarray(is_artifact, dtype=bool)
-
-    if rr.size == 0:
         return rr
 
-    if method == "none":
-        return rr
+    isnan = np.isnan(rr)
 
-    # Eğer hiç artefakt yoksa direkt dönebiliriz
-    if not np.any(is_artifact):
-        return rr
+    i = 0
+    while i < n:
+        if not isnan[i]:
+            i += 1
+            continue
 
-    if method == "remove":
-        rr_clean = rr[~is_artifact]
-        return rr_clean
+        # Bir NaN bloğuna girdik
+        start = i
+        while i < n and isnan[i]:
+            i += 1
+        end = i  # [start, end-1] NaN
 
-    if method == "interpolate":
-        rr_clean = rr.copy()
-        n = rr.size
-        good_idx = np.where(~is_artifact)[0]
+        length = end - start
 
-        # Eğer yeterli sağlam beat yoksa (<=2), dokunmadan döndür
-        if good_idx.size < 2:
-            return rr
+        if length <= max_gap_beats:
+            # Kısa boşluk: interpolasyon / doldurma
+            left_idx = start - 1
+            right_idx = end if end < n else None
 
-        artifact_idx = np.where(is_artifact)[0]
+            left_val = rr[left_idx] if left_idx >= 0 else np.nan
+            right_val = rr[right_idx] if right_idx is not None else np.nan
 
-        for i in artifact_idx:
-            # Soldaki ve sağdaki sağlam indexleri bul
-            left_candidates = good_idx[good_idx < i]
-            right_candidates = good_idx[good_idx > i]
-
-            if left_candidates.size == 0 and right_candidates.size == 0:
-                # Her yer artefakt ise yapacak pek bir şey yok
-                continue
-            elif left_candidates.size == 0:
-                # Sadece sağ komşu var => en yakın sağlam değeri kopyala
-                rr_clean[i] = rr[right_candidates[0]]
-            elif right_candidates.size == 0:
-                # Sadece sol komşu var
-                rr_clean[i] = rr[left_candidates[-1]]
+            if not np.isnan(left_val) and not np.isnan(right_val):
+                # İki taraf da mevcut -> lineer interpolasyon
+                interp_vals = np.linspace(left_val, right_val, length + 2)[1:-1]
+                rr[start:end] = interp_vals
+            elif not np.isnan(left_val):
+                # Sadece sol taraf var -> ileri doldurma
+                rr[start:end] = left_val
+            elif not np.isnan(right_val):
+                # Sadece sağ taraf var -> geri doldurma
+                rr[start:end] = right_val
             else:
-                i0 = left_candidates[-1]
-                i1 = right_candidates[0]
-                # index alanında lineer interpolasyon
-                rr_clean[i] = np.interp(i, [i0, i1], [rr[i0], rr[i1]])
+                # İki taraf da NaN ise bir şey yapma; NaN kalacak, sonra droplanır
+                pass
+        else:
+            # Uzun boşluk: NaN bırak, daha sonra droplayacağız
+            continue
 
-        return rr_clean
+    # Uzun boşluklara karşı kalan NaN'ları tamamen at
+    rr_clean = rr[~np.isnan(rr)]
 
-    raise ValueError(f"Unknown artifact correction method: {method}")
+    return rr_clean
 
 
-# ---------------------------------------------------------------------
-# 4) TEMIZLEME + RAPOR
-# ---------------------------------------------------------------------
+# -------------------- ANA TEMİZLİK FONKSİYONU -------------------- #
+
 def clean_rr_values(
     df: pd.DataFrame,
     rr_min: int = 300,
     rr_max: int = 2000,
-    max_abs_diff_ms: int = 200,
-    max_rel_diff: float = 0.20,
-    correction_method: str = "interpolate",
-    return_info: bool = False,
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    max_gap_beats: int = 3,
+) -> pd.DataFrame:
     """
-    RR serisi için tam temizlik pipeline'ı.
+    Raw RR DataFrame'ini temizler:
 
-    Adımlar:
-      1) rr_ms kolonunu numerik yap, NaN'leri at.
-      2) detect_rr_artifacts ile artefakt beat'leri işaretle.
-      3) correct_rr_artifacts ile seçilen metoda göre düzelt.
-      4) Sadece 'rr_ms' kolonunu içeren yeni bir DataFrame döndür.
+    1) 'rr_ms' kolonunu sayısal tipe çevirir.
+    2) 300–2000 ms fizyolojik aralığı dışını NaN yapar.
+    3) Kısa NaN bloklarını (<= max_gap_beats) interpolasyonla düzeltir.
+    4) Uzun blokları tamamen atar.
+    5) Temiz RR serisini 'rr_ms' kolonu olarak döner.
 
-    Parametreler:
-        rr_min, rr_max      : fiziksel aralık (ms)
-        max_abs_diff_ms     : ardışık fark için mutlak eşik (ms)
-        max_rel_diff        : ardışık fark için göreli eşik
-        correction_method   : "interpolate" / "remove" / "none"
-        return_info         : True ise temizlik istatistiklerini de döner.
-
-    Döner:
-        df_clean: tek kolonlu DataFrame ("rr_ms")
-        info    : (opsiyonel) temizlik istatistikleri dict
+    Bu adımlar, eski Colab defterindeki:
+      - fizyolojik filtre
+      - güvenli interpolasyon (kısa boşluk)
+      - problemli segmentleri dışlama
+    mantığıyla uyumludur.
     """
     df = df.copy()
 
-    # 1) rr_ms'i sayıya çevir ve NaN/boş satırları at
-    df["rr_ms"] = pd.to_numeric(df["rr_ms"], errors="coerce")
-    df = df.dropna(subset=["rr_ms"])
+    # 1) Fizyolojik outlier'ları NaN yap
+    rr_marked = _mark_outliers_physio(df["rr_ms"], rr_min=rr_min, rr_max=rr_max)
 
-    rr = df["rr_ms"].to_numpy(dtype=float)
-    n_total = int(rr.size)
+    # 2) Kısa boşlukları doldur, uzun boşlukları dışla
+    rr_array = rr_marked.to_numpy()
+    rr_clean = _interpolate_short_gaps(rr_array, max_gap_beats=max_gap_beats)
 
-    if n_total == 0:
-        df_clean = pd.DataFrame(columns=["rr_ms"])
-        info = {
-            "n_total": 0,
-            "n_artifacts": 0,
-            "artifact_percent": 0.0,
-            "correction_method": correction_method,
-        }
-        if return_info:
-            return df_clean, info
-        return df_clean, {}
-
-    # 2) Artefaktları tespit et
-    is_artifact = detect_rr_artifacts(
-        rr_ms=rr,
-        rr_min_ms=rr_min,
-        rr_max_ms=rr_max,
-        max_abs_diff_ms=max_abs_diff_ms,
-        max_rel_diff=max_rel_diff,
-    )
-
-    n_artifacts = int(is_artifact.sum())
-    artifact_percent = (n_artifacts / n_total) * 100.0
-
-    # 3) Düzelt
-    rr_clean = correct_rr_artifacts(rr, is_artifact, method=correction_method)
-
-    # 4) DataFrame oluştur ve index sıfırla
+    # 3) Son DataFrame
     df_clean = pd.DataFrame({"rr_ms": rr_clean})
     df_clean = df_clean.reset_index(drop=True)
 
-    info = {
-        "n_total": n_total,
-        "n_artifacts": n_artifacts,
-        "artifact_percent": float(artifact_percent),
-        "correction_method": correction_method,
-    }
-
-    if return_info:
-        return df_clean, info
-    return df_clean, {}
+    return df_clean
 
 
-# ---------------------------------------------------------------------
-# 5) ZAMAN VE HR EKLE
-# ---------------------------------------------------------------------
+# -------------------- ZAMAN VE HR EKLE -------------------- #
+
 def add_time_and_hr(df: pd.DataFrame, subject_id: str) -> pd.DataFrame:
     """
-    Kümülatif zaman (s), kalp hızı (bpm) ve subject_id kolonlarını ekler.
-
-    Varsayım:
-        df["rr_ms"] temizlenmiş RR intervallerini içerir.
+    Temiz RR serisine:
+      - kümülatif zaman (time_s, saniye),
+      - kalp hızı (hr_bpm),
+      - subject_id
+    kolonlarını ekler.
     """
     df = df.copy()
 
-    # Kümülatif zaman (saniye)
+    # time_s: ms -> s, kümülatif toplam
     df["time_s"] = df["rr_ms"].cumsum() / 1000.0
 
-    # Kalp hızı (bpm) -> 60000 / rr_ms
+    # hr_bpm: 60000 ms / RR (ms)
     df["hr_bpm"] = 60000.0 / df["rr_ms"]
 
-    # Subject ID
     df["subject_id"] = subject_id
 
     return df
 
 
-# ---------------------------------------------------------------------
-# 6) TEK BIR SUBJECT ICIN PIPELINE
-# ---------------------------------------------------------------------
-def process_single_subject(subject_id: str) -> None:
+# -------------------- TEK BİR SUBJECT İŞLE -------------------- #
+
+def process_single_subject(
+    subject_id: str,
+    rr_min: int = 300,
+    rr_max: int = 2000,
+    max_gap_beats: int = 3,
+) -> None:
     """
     Tek bir subject için tam pipeline:
-        raw txt -> temizlenmiş RR -> zaman & HR ekle -> *_clean.csv
-
-    Çıktı CSV kolonları:
-        - rr_ms     : temiz RR intervalleri (ms)
-        - time_s    : kümülatif zaman (s)
-        - hr_bpm    : anlık kalp hızı (bpm)
-        - subject_id
+      raw txt -> temizlenmiş rr_ms + time_s + hr_bpm -> CSV.
     """
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     df_raw = load_rr_series(subject_id)
-    df_clean, info = clean_rr_values(
+    df_clean = clean_rr_values(
         df_raw,
-        rr_min=300,
-        rr_max=2000,
-        max_abs_diff_ms=200,
-        max_rel_diff=0.20,
-        correction_method="interpolate",  # istersen "remove" yapabilirsin
-        return_info=True,
+        rr_min=rr_min,
+        rr_max=rr_max,
+        max_gap_beats=max_gap_beats,
     )
     df_final = add_time_and_hr(df_clean, subject_id)
 
     out_path = PROCESSED_DIR / f"{subject_id}_clean.csv"
     df_final.to_csv(out_path, index=False)
-
-    n_total = info["n_total"]
-    n_artifacts = info["n_artifacts"]
-    perc = info["artifact_percent"]
-
-    print(
-        f"Saved: {out_path} | beats: {n_total} | "
-        f"artifacts: {n_artifacts} ({perc:.2f}%) | "
-        f"method: {info['correction_method']}"
-    )
+    print(f"Saved: {out_path}")
 
 
-# ---------------------------------------------------------------------
-# 7) TUM SUBJECT'LER ICIN PIPELINE
-# ---------------------------------------------------------------------
+# -------------------- TÜM SUBJECT'LERİ İŞLE -------------------- #
+
 def process_all_subjects() -> None:
     """
-    RAW_DATA_DIR altındaki tüm txt dosyalarını dönerek işler.
-    Sadece ismi tamamen sayılardan oluşan dosyalar (000, 401, ...) subject kabul edilir.
+    RAW_DATA_DIR içindeki tüm *.txt dosyalarını dolaşır,
+    sayısal ID'lere sahip olanları işler.
+
+    Not:
+      - LICENSE vs. gibi dosyalar atlanır.
     """
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -349,5 +248,5 @@ def process_all_subjects() -> None:
 
 
 if __name__ == "__main__":
-    # Script olarak çalıştırıldığında tüm subject'leri işle
+    # Script olarak çalıştırıldığında tüm subject'leri yeniden üretir.
     process_all_subjects()

@@ -1,6 +1,7 @@
 import os
 import sys
-
+import numpy as np
+import pandas as pd
 from dash import Dash, html, dcc, Input, Output
 import plotly.graph_objects as go
 
@@ -110,28 +111,52 @@ app.layout = html.Div(
                     ]
                 ),
                 html.Div(
-                    style={"minWidth": "260px"},
+                    style={"minWidth": "260px", "display": "flex", "flexDirection": "column", "gap": "8px"},
                     children=[
-                        html.Label(
-                            "Subject / Session",
-                            style={"fontSize": "12px", "marginBottom": "4px"},
+                        # Subject selection
+                        html.Div(
+                            children=[
+                                html.Label(
+                                    "Subject / Session",
+                                    style={"fontSize": "12px", "marginBottom": "4px"},
+                                ),
+                                dcc.Dropdown(
+                                    id="subject-dropdown",
+                                    options=[
+                                        {"label": f"Subject {code}", "value": code}
+                                        for code in subject_codes
+                                    ],
+                                    value=subject_codes[0] if subject_codes else None,
+                                    clearable=False,
+                                    style={"color": "#000000"},
+                                ),
+                            ]
                         ),
-                        dcc.Dropdown(
-                            id="subject-dropdown",
-                            options=[
-                                {"label": f"Subject {code}", "value": code}
-                                for code in subject_codes
-                            ],
-                            value=subject_codes[0] if subject_codes else None,
-                            clearable=False,
-                            style={"color": "#000000"},
+                        # Analysis window selection
+                        html.Div(
+                            children=[
+                                html.Label(
+                                    "Analysis window",
+                                    style={"fontSize": "12px", "marginBottom": "4px"},
+                                ),
+                                dcc.Dropdown(
+                                    id="window-dropdown",
+                                    options=[
+                                        {"label": "Full recording", "value": "full"},
+                                        {"label": "Last 5 minutes", "value": "last_5min"},
+                                    ],
+                                    value="full",
+                                    clearable=False,
+                                    style={"color": "#000000"},
+                                ),
+                            ]
                         ),
                         html.Div(
                             id="subject-info",
                             style={
                                 "fontSize": "11px",
                                 "color": "#A0AEC0",
-                                "marginTop": "6px",
+                                "marginTop": "2px",
                                 "lineHeight": "1.4",
                             },
                         ),
@@ -139,7 +164,6 @@ app.layout = html.Div(
                 ),
             ],
         ),
-
         # ---------------- ORTA BÖLÜM: 3 SÜTUN ---------------- #
         html.Div(
             style={
@@ -183,7 +207,7 @@ app.layout = html.Div(
                         ),
                     ],
                 ),
-
+        
                 # ORTA SÜTUN: FREQUENCY-DOMAIN
                 html.Div(
                     style=PANEL_STYLE,
@@ -262,16 +286,36 @@ app.layout = html.Div(
         ),
     ],
 )
+# ----------------- window_to_seconds ----------------- #
+def _window_to_seconds(window_value: str | None) -> float | None:
+    """
+    UI'daki 'Analysis window' seçimini saniyeye çevirir.
+    - "full"       -> None  (tüm kayıt)
+    - "last_5min"  -> 300.0
+    Gerekirse ileride başka seçenekler de eklenebilir.
+    """
+    if window_value == "last_5min":
+        return 5 * 60.0
+    # default: full recording
+    return None
+
+
 
 
 # ----------------- CALLBACKS ----------------- #
+
+# ---------------- CALLBACKS ---------------- #
 
 @app.callback(
     Output("metrics-grid", "children"),
     Input("subject-dropdown", "value"),
 )
-def update_metrics_grid(subject_code: str):
-    """Seçilen subject için time-domain kartlarını günceller."""
+def update_metrics_grid(subject_code):
+    """
+    Sol sütundaki time-domain metrik kartlarını günceller.
+    Şu an sadece temel metrikler gösteriliyor; backend tarafında
+    daha fazla metrik hesaplanıyor olsa da burada çekirdek seti kullanıyoruz.
+    """
     metrics = get_time_domain_metrics(subject_code)
 
     cards = [
@@ -289,19 +333,24 @@ def update_metrics_grid(subject_code: str):
     Output("hr-graph", "figure"),
     Input("subject-dropdown", "value"),
 )
-def update_hr_graph(subject_code: str) -> go.Figure:
-    """Seçilen subject için HR vs time grafiğini çizer."""
+def update_hr_graph(subject_code):
+    """
+    Kalp hızı zaman serisini çizer.
+    Şu anda tam kayıt üzerinden çalışıyor (max_points ile kısaltılıyor).
+    """
     t_sec, hr_bpm = get_hr_timeseries(subject_code)
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=t_sec,
-            y=hr_bpm,
-            mode="lines",
-            name="Heart Rate",
+
+    if len(t_sec) > 0 and len(hr_bpm) > 0:
+        fig.add_trace(
+            go.Scatter(
+                x=t_sec,
+                y=hr_bpm,
+                mode="lines",
+                name="Heart Rate",
+            )
         )
-    )
 
     fig.update_layout(
         title="Heart rate over time",
@@ -314,87 +363,100 @@ def update_hr_graph(subject_code: str) -> go.Figure:
     return fig
 
 
-
 @app.callback(
     Output("lf-hf-graph", "figure"),
     Output("band-pie-graph", "figure"),
     Input("subject-dropdown", "value"),
 )
-def update_frequency_domain_graphs(subject_code: str):
-    """Seçilen subject için LF/HF spektrumu ve VLF/LF/HF dağılımını çizer."""
+def update_frequency_domain_graphs(subject_code):
+    # 1) Backend'den frekans domeni metriklerini çek (Welch)
+    fd = get_freq_domain_metrics(subject_code)
 
-    # Backend'den frekans domeni metriklerini al
-    try:
-        fd = get_freq_domain_metrics(subject_code)
-    except ValueError:
-        # Örneğin kayıt çok kısaysa buraya düşer
-        empty_fig = go.Figure()
-        empty_fig.update_layout(
-            template="plotly_dark",
-            margin=dict(l=40, r=20, t=40, b=40),
-        )
-        return empty_fig, empty_fig
-
-    freq = fd.get("freq", [])
-    psd = fd.get("psd", [])
+    freq = np.array(fd.get("freq", []), dtype=float)
+    psd = np.array(fd.get("psd", []), dtype=float)
     band_powers = fd.get("band_powers", {})
 
-    # Veri yoksa boş figür dön
-    if not freq or not psd:
+    # Veri yoksa: boş figürler döndür
+    if freq.size == 0 or psd.size == 0:
         empty_fig = go.Figure()
         empty_fig.update_layout(
             template="plotly_dark",
             margin=dict(l=40, r=20, t=40, b=40),
+            height=230,
         )
-        return empty_fig, empty_fig
 
-    # LF ve HF bantlarını ayır (Hz cinsinden)
-    lf_low, lf_high = 0.04, 0.15
-    hf_low, hf_high = 0.15, 0.40
+        pie_fig = go.Figure(
+            data=[
+                go.Pie(
+                    labels=["VLF", "LF", "HF"],
+                    values=[0, 0, 0],
+                    hole=0.3,
+                )
+            ]
+        )
+        pie_fig.update_layout(
+            title="VLF / LF / HF power distribution",
+            template="plotly_dark",
+            margin=dict(l=20, r=20, t=30, b=30),
+            height=220,
+        )
+        return empty_fig, pie_fig
 
-    lf_freq, lf_psd = [], []
-    hf_freq, hf_psd = [], []
+    max_psd = float(psd.max())
 
-    for f_val, p_val in zip(freq, psd):
-        if lf_low <= f_val < lf_high:
-            lf_freq.append(f_val)
-            lf_psd.append(p_val)
-        elif hf_low <= f_val < hf_high:
-            hf_freq.append(f_val)
-            hf_psd.append(p_val)
+    # 2) PSD grafiği (tam spektrum) + arkaplanda band shading
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=freq,
+            y=psd,
+            mode="lines",
+            name="PSD (Welch)",
+        )
+    )
 
-    # LF / HF line chart
-    lfhf_fig = go.Figure()
-    if lf_freq:
-        lfhf_fig.add_trace(
-            go.Scatter(
-                x=lf_freq,
-                y=lf_psd,
-                mode="lines",
-                name="LF",
+    bands = {
+        "VLF": (0.0033, 0.04),
+        "LF": (0.04, 0.15),
+        "HF": (0.15, 0.40),
+    }
+
+    colors = {
+        "VLF": "rgba(56, 161, 105, 0.25)",   # yeşilimsi
+        "LF": "rgba(66, 153, 225, 0.25)",   # mavi
+        "HF": "rgba(237, 100, 166, 0.25)",  # pembe
+    }
+
+    shapes = []
+    for name, (f_low, f_high) in bands.items():
+        shapes.append(
+            dict(
+                type="rect",
+                xref="x",
+                yref="y",
+                x0=f_low,
+                x1=f_high,
+                y0=0,
+                y1=max_psd * 1.05,
+                fillcolor=colors[name],
+                opacity=0.25,
+                line=dict(width=0),
+                layer="below",
             )
         )
-    if hf_freq:
-        lfhf_fig.add_trace(
-            go.Scatter(
-                x=hf_freq,
-                y=hf_psd,
-                mode="lines",
-                name="HF",
-            )
-        )
 
-    lfhf_fig.update_layout(
-        title="LF / HF power spectrum",
+    fig.update_layout(
+        title="HRV power spectrum (Welch)",
         xaxis_title="Frequency (Hz)",
-        yaxis_title="Power (a.u.)",
+        yaxis_title="Power (ms²/Hz)",
         template="plotly_dark",
         margin=dict(l=40, r=20, t=40, b=40),
         height=230,
+        shapes=shapes,
         legend=dict(orientation="h", y=-0.2),
     )
 
-    # VLF / LF / HF pie chart
+    # 3) Pie chart: VLF / LF / HF dağılımı
     labels = ["VLF", "LF", "HF"]
     values = [
         band_powers.get("VLF", 0.0),
@@ -412,33 +474,38 @@ def update_frequency_domain_graphs(subject_code: str):
         ]
     )
     pie_fig.update_layout(
-        title="VLF / LF / HF power distribution",
+        title="VLF / LF / HF power distribution (Welch)",
         template="plotly_dark",
         margin=dict(l=20, r=20, t=30, b=30),
         height=220,
     )
 
-    return lfhf_fig, pie_fig
+    return fig, pie_fig
+
 
 
 @app.callback(
     Output("poincare-graph", "figure"),
     Input("subject-dropdown", "value"),
 )
-def update_poincare_graph(subject_code: str) -> go.Figure:
-    """Seçilen subject için Poincaré scatter grafiğini çizer."""
+def update_poincare_graph(subject_code):
+    """
+    Sağ sütundaki Poincaré scatter grafiğini günceller.
+    """
     data = get_poincare_data(subject_code)
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=data["x"],
-            y=data["y"],
-            mode="markers",
-            marker=dict(size=4, opacity=0.6),
-            name="RRn vs RRn+1",
+
+    if data["x"] and data["y"]:
+        fig.add_trace(
+            go.Scatter(
+                x=data["x"],
+                y=data["y"],
+                mode="markers",
+                marker=dict(size=4, opacity=0.6),
+                name="RRn vs RRn+1",
+            )
         )
-    )
 
     fig.update_layout(
         title="Poincaré plot (RRn vs RRn+1)",
@@ -455,8 +522,10 @@ def update_poincare_graph(subject_code: str) -> go.Figure:
     Output("poincare-metrics", "children"),
     Input("subject-dropdown", "value"),
 )
-def update_poincare_metrics(subject_code: str):
-    """Seçilen subject için SD1 / SD2 / oran / stress index kartlarını günceller."""
+def update_poincare_metrics(subject_code):
+    """
+    Sağ sütundaki SD1 / SD2 / oran / stress kartlarını günceller.
+    """
     data = get_poincare_data(subject_code)
 
     sd1 = data["sd1"]
@@ -477,8 +546,10 @@ def update_poincare_metrics(subject_code: str):
     Output("subject-info", "children"),
     Input("subject-dropdown", "value"),
 )
-def update_subject_info(subject_code: str):
-    """Seçilen subject için yaş / cinsiyet / grup bilgisini gösterir."""
+def update_subject_info(subject_code):
+    """
+    Üst sağdaki subject yaş / cinsiyet / grup bilgisini günceller.
+    """
     info = get_subject_info(subject_code)
 
     age = info.get("age")
@@ -492,7 +563,7 @@ def update_subject_info(subject_code: str):
         age_str = "Unknown"
     else:
         if isinstance(age, (int, float)):
-            age_str = str(int(age))  # 53.0 -> "53"
+            age_str = str(int(age))
         else:
             age_str = str(age)
 
@@ -514,21 +585,30 @@ def update_subject_info(subject_code: str):
     Output("signal-quality-text", "children"),
     Input("subject-dropdown", "value"),
 )
-def update_status_bar(subject_code: str):
+def update_status_bar(subject_code):
     """
-    Seçilen subject için alt bardaki status ve signal quality metnini günceller.
-    Tamamen sinyal kalitesine yönelik teknik bir değerlendirmedir.
+    Alt bar'daki sinyal kalite özetini günceller.
+    get_signal_status sadece subject_code alıyor, pencere almıyor.
     """
     status = get_signal_status(subject_code)
 
-    status_text = status.get("status_text", "Status unavailable")
     quality_label = status.get("quality_label", "Unknown")
+    status_text = status.get("status_text", "No status available")
     outlier_percent = status.get("outlier_percent", 0.0)
 
-    quality_str = f"Signal quality: {quality_label} · Irregular RR: {outlier_percent:.1f}% · Source: recorded RR file"
+    # Status: ... kısmı
+    status_msg = status_text
 
-    return status_text, quality_str
+    # Signal quality: ... kısmı
+    quality_msg = (
+        f"Signal quality: {quality_label}"
+        f" · Irregular beats ≈ {outlier_percent:.1f}%"
+        f" · Source: recorded RR file"
+    )
+
+    return status_msg, quality_msg
 
 
 if __name__ == "__main__":
     app.run(debug=True)
+

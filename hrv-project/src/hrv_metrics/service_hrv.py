@@ -73,132 +73,287 @@ def load_rr_from_csv(subject_code: str) -> np.ndarray:
 
 def _compute_time_domain_from_rr(rr: np.ndarray) -> dict:
     """
-    Tek boyutlu RR serisinden temel time-domain HRV metriklerini hesaplar.
+    Tek boyutlu RR serisinden temel ve ilerletilmiş time-domain HRV metriklerini hesaplar.
+
     rr: saniye cinsinden RR intervalleri (ör: 0.8 = 800 ms)
-    Dönen değerler dict: sdnn, rmssd, pnn50, mean_hr, hr_max, hr_min
+
+    Dönen değerler (ms veya bpm):
+      - sdnn, sdrr, rmssd
+      - nn50, pnn50
+      - mean_hr, hr_max, hr_min, hr_range
+      - hti, tinn (histogram tabanlı metrikler)
+      - n_beats, duration_s
     """
     rr = np.asarray(rr, dtype=float)
 
+    # Çok kısa dizi için NaN dön (dashboard'ı patlatma)
     if rr.ndim != 1 or rr.size < 2:
-        raise ValueError("RR series must be 1D and contain at least 2 samples")
+        return {
+            "sdnn": float("nan"),
+            "sdrr": float("nan"),
+            "rmssd": float("nan"),
+            "nn50": 0,
+            "pnn50": float("nan"),
+            "mean_hr": float("nan"),
+            "hr_max": float("nan"),
+            "hr_min": float("nan"),
+            "hr_range": float("nan"),
+            "hti": float("nan"),
+            "tinn": float("nan"),
+            "n_beats": int(rr.size),
+            "duration_s": float(np.sum(rr)) if rr.size > 0 else 0.0,
+        }
 
     # ms cinsine çevir
     rr_ms = rr * 1000.0
 
-    # SDNN (ms)
+    # Temel istatistikler
+    n_beats = int(rr_ms.size)
+    duration_s = float(np.sum(rr))  # saniye
+
+    # SDNN / SDRR (ms)
     sdnn = float(np.std(rr_ms, ddof=1))
+    sdrr = sdnn
 
     # RMSSD (ms)
     diff_ms = np.diff(rr_ms)
-    rmssd = float(np.sqrt(np.mean(diff_ms ** 2)))
+    if diff_ms.size > 0:
+        rmssd = float(np.sqrt(np.mean(diff_ms ** 2)))
+    else:
+        rmssd = float("nan")
 
     # NN50 & pNN50 (%)
     nn50 = int(np.sum(np.abs(diff_ms) > 50.0))
-    if diff_ms.size > 0:
-        pnn50 = float(nn50 / diff_ms.size * 100.0)
-    else:
-        pnn50 = 0.0
+    pnn50 = float(nn50 / diff_ms.size * 100.0) if diff_ms.size > 0 else float("nan")
 
     # Mean RR, HR min/max (bpm)
-    mean_rr = float(np.mean(rr))
+    mean_rr = float(np.mean(rr))          # saniye
     min_rr = float(np.min(rr))
     max_rr = float(np.max(rr))
 
     mean_hr = float(60.0 / mean_rr) if mean_rr > 0 else float("nan")
-    hr_max = float(60.0 / min_rr) if min_rr > 0 else float("nan")
-    hr_min = float(60.0 / max_rr) if max_rr > 0 else float("nan")
+    hr_max = float(60.0 / min_rr) if min_rr > 0 else float("nan")  # en kısa RR -> en yüksek HR
+    hr_min = float(60.0 / max_rr) if max_rr > 0 else float("nan")  # en uzun RR -> en düşük HR
+    hr_range = (
+        float(hr_max - hr_min)
+        if np.isfinite(hr_max) and np.isfinite(hr_min)
+        else float("nan")
+    )
+
+    # Histogram tabanlı HTI ve TINN (eski defterdeki mantık)
+    try:
+        counts, bins = np.histogram(rr_ms, bins="auto")
+        if counts.size == 0 or counts.max() == 0:
+            hti = float("nan")
+            tinn = float("nan")
+        else:
+            # HTI: toplam beat sayısı / en yüksek histogram barı
+            hti = float(n_beats / counts.max())
+
+            peak_idx = int(np.argmax(counts))
+            left_idx = np.where(counts[:peak_idx] < 0.05 * counts.max())[0]
+            right_idx = np.where(counts[peak_idx:] < 0.05 * counts.max())[0]
+
+            if left_idx.size > 0:
+                left = bins[left_idx[-1]]
+            else:
+                left = bins[0]
+
+            if right_idx.size > 0:
+                right = bins[peak_idx + right_idx[0]]
+            else:
+                right = bins[-1]
+
+            tinn = float(right - left)
+    except Exception:
+        hti = float("nan")
+        tinn = float("nan")
 
     return {
         "sdnn": sdnn,
+        "sdrr": sdrr,
         "rmssd": rmssd,
+        "nn50": nn50,
         "pnn50": pnn50,
         "mean_hr": mean_hr,
         "hr_max": hr_max,
         "hr_min": hr_min,
+        "hr_range": hr_range,
+        "hti": hti,
+        "tinn": tinn,
+        "n_beats": n_beats,
+        "duration_s": duration_s,
     }
+
+
+def _apply_time_window(rr: np.ndarray, window_length_s: float | None) -> np.ndarray:
+    """
+    RR serisini (saniye cinsinden) verilen pencere süresine göre kırpar.
+    - window_length_s None ise: tüm kayıt kullanılır.
+    - window_length_s > 0 ise: sadece SON window_length_s saniyeyi kapsayan
+      RR intervalleri döner.
+
+    Örnek:
+        total_duration = 1200 s ve window_length_s = 300 s ise,
+        son 300 saniyeye düşen RR'ler alınır.
+    """
+    rr = np.asarray(rr, dtype=float)
+    if rr.size == 0:
+        return rr
+    if window_length_s is None or window_length_s <= 0:
+        return rr
+
+    t_cum = np.cumsum(rr)  # kümülatif zaman (s)
+    total_duration = float(t_cum[-1])
+
+    # Kayıt zaten 5 dakikadan kısaysa -> dokunma
+    if total_duration <= window_length_s:
+        return rr
+
+    start_time = total_duration - window_length_s
+    mask = t_cum >= start_time
+    return rr[mask]
+
+
 
 # -------------------- FREQUENCY-DOMAIN HESAP -------------------- #
 
 # Computes VLF / LF / HF band powers from RR series (seconds)
-def _compute_freq_domain_from_rr(rr: np.ndarray, fs_resample: float = 4.0) -> dict:
+# -------------------- FREQUENCY-DOMAIN HESAP -------------------- #
+
+def _compute_freq_domain_from_rr(
+    rr: np.ndarray,
+    fs_resample: float = 4.0,
+) -> dict:
     """
-    RR serisini (saniye cinsinden) zaman eksenine yerleştirip
-    sabit örneklemeli bir sinyale (4 Hz) yeniden örnekler,
-    ardından Welch yöntemi ile PSD hesaplayıp VLF / LF / HF güçlerini döner.
+    RR (saniye) serisinden frekans-domeni HRV metriklerini hesaplar.
+
+    Adımlar:
+      1) Kümülatif zamana göre RR(t) elde et.
+      2) Sabit örneklem frekansına (fs_resample) göre yeniden örnekle.
+      3) Ortalama çıkar ve Welch yöntemi ile PSD hesapla.
+      4) VLF / LF / HF band güçlerini integre et.
     """
     rr = np.asarray(rr, dtype=float)
+    if rr.size < 4:
+        return {
+            "freq": [],
+            "psd": [],
+            "band_powers": {"VLF": 0.0, "LF": 0.0, "HF": 0.0},
+            "lf_hf_ratio": float("nan"),
+        }
 
-    if rr.ndim != 1 or rr.size < 4:
-        raise ValueError("RR series must be 1D and contain at least 4 samples")
-
-    # 1) Zaman ekseni: kümülatif RR (saniye)
+    # Zaman ekseni (saniye)
     t = np.cumsum(rr)
-    t = t - t[0]  # 0'dan başlat
+    total_duration = float(t[-1])
+    if total_duration <= 0:
+        return {
+            "freq": [],
+            "psd": [],
+            "band_powers": {"VLF": 0.0, "LF": 0.0, "HF": 0.0},
+            "lf_hf_ratio": float("nan"),
+        }
 
-    # 2) Uniform zaman ekseni (örneğin 4 Hz)
-    if t[-1] <= 0:
-        raise ValueError("Total duration must be positive")
-
+    # Sabit örneklem zaman ekseni
     dt = 1.0 / fs_resample
-    t_uniform = np.arange(0.0, t[-1], dt)
+    t_uniform = np.arange(0.0, total_duration, dt)
+    if t_uniform.size < 4:
+        return {
+            "freq": [],
+            "psd": [],
+            "band_powers": {"VLF": 0.0, "LF": 0.0, "HF": 0.0},
+            "lf_hf_ratio": float("nan"),
+        }
 
-    if t_uniform.size < 8:
-        raise ValueError("Not enough duration for frequency analysis")
+    # RR(t) sinyalini yeniden örnekle (cubic spline ile, olmazsa lineer)
+    try:
+        cs = CubicSpline(t, rr, bc_type="natural")
+        rr_interp = cs(t_uniform)
+    except Exception:
+        rr_interp = np.interp(t_uniform, t, rr)
 
-    # 3) RR sinyalini uniform eksene spline ile yeniden örnekle
-    spline = CubicSpline(t, rr)
-    rr_interp = spline(t_uniform)
-
-    # 4) Trend'i kaldır (ortalama çıkar)
+    # Detrend (ortalama çıkar)
     rr_detrended = rr_interp - np.mean(rr_interp)
 
-    # 5) Welch ile PSD
-    nperseg = min(256, rr_detrended.size)
-    f, Pxx = welch(rr_detrended, fs=fs_resample, nperseg=nperseg)
+    # Welch PSD
+    nperseg = min(256, t_uniform.size)
+    freq, psd = welch(
+        rr_detrended,
+        fs=fs_resample,
+        nperseg=nperseg,
+        detrend="constant",
+        scaling="density",
+    )
 
-    # 6) Bant güçleri
-    bands = {
-        "VLF": (0.0033, 0.04),
-        "LF":  (0.04, 0.15),
-        "HF":  (0.15, 0.40),
-    }
+    # Bant güçlerini hesapla
+    def _band_power(f_low: float, f_high: float) -> float:
+        mask = (freq >= f_low) & (freq < f_high)
+        if not np.any(mask):
+            return 0.0
+        return float(np.trapz(psd[mask], freq[mask]))
 
-    band_powers = {}
-    for name, (low, high) in bands.items():
-        mask = (f >= low) & (f < high)
-        if np.any(mask):
-            band_powers[name] = float(np.trapz(Pxx[mask], f[mask]))
-        else:
-            band_powers[name] = 0.0
+    vlf = _band_power(0.0033, 0.04)
+    lf = _band_power(0.04, 0.15)
+    hf = _band_power(0.15, 0.40)
 
-    lf_power = band_powers.get("LF", 0.0)
-    hf_power = band_powers.get("HF", 0.0)
-    lf_hf_ratio = float(lf_power / hf_power) if hf_power > 0 else float("nan")
+    lf_hf_ratio = float(lf / hf) if hf > 0 else float("nan")
 
-    # İleride Dash grafikleri için lazım olabilecek her şeyi döndürüyoruz
     return {
-        "freq": f.tolist(),          # frekans ekseni (Hz)
-        "psd": Pxx.tolist(),         # PSD değerleri
-        "band_powers": band_powers,  # dict: VLF/LF/HF
+        "freq": freq.tolist(),
+        "psd": psd.tolist(),
+        "band_powers": {"VLF": vlf, "LF": lf, "HF": hf},
         "lf_hf_ratio": lf_hf_ratio,
     }
 
 
+def get_freq_domain_metrics(
+    subject_code: str,
+    window_length_s: float | None = None,
+    fs_resample: float = 4.0,
+) -> dict:
+    """
+    Belirli bir subject için frekans-domeni HRV metriklerini hesaplar
+    (Welch yöntemi).
+
+    - RR saniye cinsinden okunur
+    - window_length_s verilirse, sadece SON pencere kullanılır
+    - Sonra _compute_freq_domain_from_rr ile PSD + band güçleri hesaplanır
+    """
+    rr = load_rr_from_csv(subject_code)          # saniye cinsinden RR
+    rr = _apply_time_window(rr, window_length_s)  # None ise tüm kayıt
+
+    fd = _compute_freq_domain_from_rr(rr, fs_resample=fs_resample)
+    fd["window_length_s"] = window_length_s
+    return fd
 
 
 
-def get_hr_timeseries(subject_code: str, max_points: int = 500):
+
+
+
+
+
+
+def get_hr_timeseries(
+    subject_code: str,
+    max_points: int = 500,
+    window_length_s: float | None = None,
+):
     """
     Belirli bir denek için RR serisinden HR (bpm) zaman serisi üretir.
     - RR saniye cinsinden.
-    - Zaman ekseni: kümülatif RR (gerçek geçen süre).
+    - Eğer window_length_s verilirse sadece son pencere kullanılır.
+    - Zaman ekseni: seçilen pencere için kümülatif RR (0'dan başlatılır).
     """
-    rr = load_rr_from_csv(subject_code)  # zaten var olan fonksiyon
+    rr = load_rr_from_csv(subject_code)
+
+    # 5 dakikalık (veya verilen) pencere uygula
+    rr = _apply_time_window(rr, window_length_s)
 
     if rr.size < 1:
         return [], []
 
-    # Zaman ekseni: rr'lerin kümülatif toplamı (saniye)
+    # Zaman ekseni: seçilen pencere için kümülatif zaman (saniye)
     t_sec = np.cumsum(rr)
 
     # Kalp hızı: bpm
@@ -213,45 +368,42 @@ def get_hr_timeseries(subject_code: str, max_points: int = 500):
 
 
 
-def get_time_domain_metrics(subject_code: str = "000") -> dict:
+
+def get_time_domain_metrics(
+    subject_code: str = "000",
+    window_length_s: float | None = None,
+) -> dict:
     """
-    Dashboard tarafından kullanılan ana fonksiyon.
-    - Belirli bir subject_code için (örn: '000') RR verisini CSV'den okur,
-    - Time-domain metrikleri hesaplar,
-    - Dashboard'un beklediği sade dict'i döner.
+    Belirli bir subject için time-domain HRV metriklerini hesaplar.
+
+    - RR serisi saniye cinsinden okunur.
+    - Eğer window_length_s verilirse, bu sürelik son pencere kullanılır
+      (örneğin 300 s = son 5 dakika).
+    - Metrikler _compute_time_domain_from_rr fonksiyonundan gelir.
     """
-    rr = load_rr_from_csv(subject_code)
+    rr = load_rr_from_csv(subject_code)  # saniye cinsinden
+    rr = _apply_time_window(rr, window_length_s)
+
     td = _compute_time_domain_from_rr(rr)
+    td["window_length_s"] = window_length_s
     return td
 
-def get_time_domain_metrics(subject_code: str = "000") -> dict:
-    """
-    Dashboard tarafından kullanılan ana fonksiyon.
-    ...
-    """
-    rr = load_rr_from_csv(subject_code)
-    td = _compute_time_domain_from_rr(rr)
-    return td
-
-
-def get_freq_domain_metrics(subject_code: str = "000", fs_resample: float = 4.0) -> dict:
-    """
-    Dashboard tarafından kullanılan frekans domeni fonksiyonu.
-    - Belirli bir subject_code için RR verisini okur,
-    - VLF / LF / HF band güçlerini ve LF/HF oranını hesaplar.
-    """
-    rr = load_rr_from_csv(subject_code)
-    fd = _compute_freq_domain_from_rr(rr, fs_resample=fs_resample)
-    return fd
-
-
-def get_poincare_data(subject_code: str, max_points: int = 1000) -> dict:
+def get_poincare_data(
+    subject_code: str,
+    max_points: int = 1000,
+    window_length_s: float | None = None,
+) -> dict:
     """
     Poincaré diyagramı için:
     - RR_n ve RR_{n+1} (ms cinsinden)
     - SD1, SD2, SD1/SD2 oranı ve basit bir stress index döner.
+
+    Eğer window_length_s verilirse, sadece son window_length_s saniyeye
+    düşen RR intervalleri kullanılır.
     """
     rr = load_rr_from_csv(subject_code)  # saniye cinsinden RR
+
+    rr = _apply_time_window(rr, window_length_s)
 
     if rr.size < 3:
         return {
@@ -281,12 +433,10 @@ def get_poincare_data(subject_code: str, max_points: int = 1000) -> dict:
     var_diff = float(np.var(diff_ms, ddof=1))
 
     sd1 = float(np.sqrt(0.5 * var_diff))            # sd1
-    # içi negatif olmasın diye max(..., 0.0)
     sd2_inside = 2.0 * (sdnn ** 2) - 0.5 * var_diff
     sd2 = float(np.sqrt(max(sd2_inside, 0.0)))      # sd2
 
     sd1_sd2_ratio = float(sd1 / sd2) if sd2 > 0 else float("nan")
-    # Şimdilik basit bir numerik stress index: SD2/SD1
     stress_index = float(sd2 / sd1) if sd1 > 0 else float("nan")
 
     return {
@@ -297,6 +447,7 @@ def get_poincare_data(subject_code: str, max_points: int = 1000) -> dict:
         "sd1_sd2_ratio": sd1_sd2_ratio,
         "stress_index": stress_index,
     }
+
 
 
 def get_subject_info(subject_code: str) -> dict:
