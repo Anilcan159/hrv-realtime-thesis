@@ -1,15 +1,14 @@
 import os
 import sys
 
-CURRENT_DIR = os.path.dirname(__file__)
-SRC_DIR = os.path.dirname(CURRENT_DIR)
-
-if SRC_DIR not in sys.path:
-    sys.path.append(SRC_DIR)
-
 from dash import Dash, html, dcc, Input, Output
 import plotly.graph_objects as go
-import math
+
+# Proje kökünü sys.path'e ekle (src içinden import için)
+CURRENT_DIR = os.path.dirname(__file__)
+SRC_DIR = os.path.dirname(CURRENT_DIR)
+if SRC_DIR not in sys.path:
+    sys.path.append(SRC_DIR)
 
 from hrv_metrics.service_hrv import (
     get_time_domain_metrics,
@@ -18,83 +17,19 @@ from hrv_metrics.service_hrv import (
     get_poincare_data,
     get_subject_info,
     get_freq_domain_metrics,
+    get_signal_status,      # 👈 YENİ
 )
 
-
+# Dash uygulaması
 app = Dash(__name__)
-# ----------------- GLOBAL DEGISKENLER ----------------- #
+
+# Uygulama açılışında bir kez okunacak subject listesi
 subject_codes = get_available_subject_codes()
 
 
-
-# ----------------- DUMMY VERI (sadece layout görmek için) ----------------- #
-
-time_points = list(range(60))
-
-lf_values = [500 + 80 * math.sin(t / 10) for t in time_points]
-hf_values = [400 + 60 * math.cos(t / 8) for t in time_points]
-
-# Pie için örnek değerler
-vlf_power = 200
-lf_power = 450
-hf_power = 350
-
-# Poincaré plot için örnek RR serisi
-rr_base = 0.8  # 800 ms
-rr_series = [rr_base + 0.05 * math.sin(t / 4) for t in range(200)]
-rr_n = rr_series[:-1]
-rr_n1 = rr_series[1:]
-
-# ----------------- PLOTLY FIGURE'LERI ----------------- #
-
-
-# LF/HF line chart
-lfhf_fig = go.Figure()
-lfhf_fig.add_trace(go.Scatter(x=time_points, y=lf_values, mode="lines", name="LF"))
-lfhf_fig.add_trace(go.Scatter(x=time_points, y=hf_values, mode="lines", name="HF"))
-lfhf_fig.update_layout(
-    margin=dict(l=20, r=20, t=30, b=30),
-    template="plotly_dark",
-    xaxis_title="Time (s)",
-    yaxis_title="Power (a.u.)",
-)
-
-# VLF / LF / HF pie chart
-pie_fig = go.Figure(
-    data=[
-        go.Pie(
-            labels=["VLF", "LF", "HF"],
-            values=[vlf_power, lf_power, hf_power],
-            hole=0.3,
-        )
-    ]
-)
-pie_fig.update_layout(
-    margin=dict(l=20, r=20, t=30, b=30),
-    template="plotly_dark",
-)
-
-# Poincaré scatter
-poincare_fig = go.Figure()
-poincare_fig.add_trace(
-    go.Scatter(
-        x=rr_n,
-        y=rr_n1,
-        mode="markers",
-        marker=dict(size=5),
-        name="RR_n vs RR_n+1",
-    )
-)
-poincare_fig.update_layout(
-    margin=dict(l=20, r=20, t=30, b=30),
-    template="plotly_dark",
-    xaxis_title="RR_n (s)",
-    yaxis_title="RR_n+1 (s)",
-)
-
-
 # ----------------- KÜÇÜK YARDIMCI: METRIC CARD ----------------- #
-def metric_card(title: str, value: str, unit: str = ""):
+def metric_card(title: str, value: str, unit: str = "") -> html.Div:
+    """Dashboard üzerinde metrik gösterimi için basit kart bileşeni."""
     return html.Div(
         style={
             "backgroundColor": "#223459",
@@ -108,7 +43,11 @@ def metric_card(title: str, value: str, unit: str = ""):
         children=[
             html.Span(
                 title,
-                style={"fontSize": "12px", "color": "#A0AEC0", "letterSpacing": "0.05em"},
+                style={
+                    "fontSize": "12px",
+                    "color": "#A0AEC0",
+                    "letterSpacing": "0.05em",
+                },
             ),
             html.Div(
                 style={"display": "flex", "alignItems": "baseline", "gap": "4px"},
@@ -126,11 +65,20 @@ def metric_card(title: str, value: str, unit: str = ""):
         ],
     )
 
-
 # ----------------- APP LAYOUT ----------------- #
 # layout'tan ÖNCE bir yerde:
-subject_codes = get_available_subject_codes()
+# Ortak panel stili (3 sütun için)
+PANEL_STYLE = {
+    "backgroundColor": "#131F39",
+    "border": "1px solid #223459",
+    "borderRadius": "12px",
+    "padding": "15px",
+    "display": "flex",
+    "flexDirection": "column",
+    "gap": "12px",
+}
 
+# ----------------- APP LAYOUT ----------------- #
 app.layout = html.Div(
     style={
         "backgroundColor": "#131F39",
@@ -203,15 +151,7 @@ app.layout = html.Div(
             children=[
                 # SOL SÜTUN: TIME-DOMAIN + HR
                 html.Div(
-                    style={
-                        "backgroundColor": "#131F39",
-                        "border": "1px solid #223459",
-                        "borderRadius": "12px",
-                        "padding": "15px",
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "12px",
-                    },
+                    style=PANEL_STYLE,
                     children=[
                         html.H3("Time-domain metrics", style={"marginBottom": "5px"}),
                         html.Span(
@@ -246,15 +186,7 @@ app.layout = html.Div(
 
                 # ORTA SÜTUN: FREQUENCY-DOMAIN
                 html.Div(
-                    style={
-                        "backgroundColor": "#131F39",
-                        "border": "1px solid #223459",
-                        "borderRadius": "12px",
-                        "padding": "15px",
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "12px",
-                    },
+                    style=PANEL_STYLE,
                     children=[
                         html.H3("Frequency-domain metrics"),
                         html.Span(
@@ -269,21 +201,12 @@ app.layout = html.Div(
                             id="band-pie-graph",
                             style={"height": "220px"},
                         ),
-
                     ],
                 ),
 
                 # SAĞ SÜTUN: POINCARÉ + NON-LINEAR
                 html.Div(
-                    style={
-                        "backgroundColor": "#131F39",
-                        "border": "1px solid #223459",
-                        "borderRadius": "12px",
-                        "padding": "15px",
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "12px",
-                    },
+                    style=PANEL_STYLE,
                     children=[
                         html.H3("Poincaré & non-linear indices"),
                         html.Span(
@@ -313,20 +236,26 @@ app.layout = html.Div(
             style={
                 "backgroundColor": "#223459",
                 "borderRadius": "10px",
-                "padding": "10px 15px",
+                "padding": "10px"
+                "5px",
                 "display": "flex",
                 "justifyContent": "space-between",
                 "alignItems": "center",
             },
             children=[
                 html.Div(
+                    id="status-bar",
                     children=[
                         html.Span("Status: ", style={"fontWeight": "bold"}),
-                        html.Span("Normal (no alerts detected in the last window)"),
-                    ]
+                        html.Span(
+                            id="status-text",
+                            children="Normal (no alerts detected in the last window)",
+                        ),
+                    ],
                 ),
                 html.Span(
-                    "Signal quality: OK · Update source: dummy data",
+                    id="signal-quality-text",
+                    children="Signal quality: OK · Source: recorded RR file",
                     style={"fontSize": "12px", "color": "#A0AEC0"},
                 ),
             ],
@@ -335,14 +264,16 @@ app.layout = html.Div(
 )
 
 
-# ---------------- CALLBACKS ---------------- #
+# ----------------- CALLBACKS ----------------- #
 
 @app.callback(
     Output("metrics-grid", "children"),
     Input("subject-dropdown", "value"),
 )
-def update_metrics_grid(subject_code):
+def update_metrics_grid(subject_code: str):
+    """Seçilen subject için time-domain kartlarını günceller."""
     metrics = get_time_domain_metrics(subject_code)
+
     cards = [
         metric_card("SDNN", f"{metrics['sdnn']:.1f}", "ms"),
         metric_card("RMSSD", f"{metrics['rmssd']:.1f}", "ms"),
@@ -358,7 +289,8 @@ def update_metrics_grid(subject_code):
     Output("hr-graph", "figure"),
     Input("subject-dropdown", "value"),
 )
-def update_hr_graph(subject_code):
+def update_hr_graph(subject_code: str) -> go.Figure:
+    """Seçilen subject için HR vs time grafiğini çizer."""
     t_sec, hr_bpm = get_hr_timeseries(subject_code)
 
     fig = go.Figure()
@@ -381,20 +313,33 @@ def update_hr_graph(subject_code):
     )
     return fig
 
+
+
 @app.callback(
     Output("lf-hf-graph", "figure"),
     Output("band-pie-graph", "figure"),
     Input("subject-dropdown", "value"),
 )
-def update_frequency_domain_graphs(subject_code):
-    # 1) Backend'den frekans domeni metriklerini çek
-    fd = get_freq_domain_metrics(subject_code)
+def update_frequency_domain_graphs(subject_code: str):
+    """Seçilen subject için LF/HF spektrumu ve VLF/LF/HF dağılımını çizer."""
+
+    # Backend'den frekans domeni metriklerini al
+    try:
+        fd = get_freq_domain_metrics(subject_code)
+    except ValueError:
+        # Örneğin kayıt çok kısaysa buraya düşer
+        empty_fig = go.Figure()
+        empty_fig.update_layout(
+            template="plotly_dark",
+            margin=dict(l=40, r=20, t=40, b=40),
+        )
+        return empty_fig, empty_fig
 
     freq = fd.get("freq", [])
     psd = fd.get("psd", [])
     band_powers = fd.get("band_powers", {})
 
-    # Eğer veri yoksa boş figür dön
+    # Veri yoksa boş figür dön
     if not freq or not psd:
         empty_fig = go.Figure()
         empty_fig.update_layout(
@@ -403,22 +348,22 @@ def update_frequency_domain_graphs(subject_code):
         )
         return empty_fig, empty_fig
 
-    # 2) LF ve HF bantlarını ayır (Hz cinsinden)
+    # LF ve HF bantlarını ayır (Hz cinsinden)
     lf_low, lf_high = 0.04, 0.15
     hf_low, hf_high = 0.15, 0.40
 
     lf_freq, lf_psd = [], []
     hf_freq, hf_psd = [], []
 
-    for f, p in zip(freq, psd):
-        if lf_low <= f < lf_high:
-            lf_freq.append(f)
-            lf_psd.append(p)
-        elif hf_low <= f < hf_high:
-            hf_freq.append(f)
-            hf_psd.append(p)
+    for f_val, p_val in zip(freq, psd):
+        if lf_low <= f_val < lf_high:
+            lf_freq.append(f_val)
+            lf_psd.append(p_val)
+        elif hf_low <= f_val < hf_high:
+            hf_freq.append(f_val)
+            hf_psd.append(p_val)
 
-    # 3) Line chart: LF ve HF spektrumu
+    # LF / HF line chart
     lfhf_fig = go.Figure()
     if lf_freq:
         lfhf_fig.add_trace(
@@ -449,7 +394,7 @@ def update_frequency_domain_graphs(subject_code):
         legend=dict(orientation="h", y=-0.2),
     )
 
-    # 4) Pie chart: VLF / LF / HF band güçleri
+    # VLF / LF / HF pie chart
     labels = ["VLF", "LF", "HF"]
     values = [
         band_powers.get("VLF", 0.0),
@@ -480,7 +425,8 @@ def update_frequency_domain_graphs(subject_code):
     Output("poincare-graph", "figure"),
     Input("subject-dropdown", "value"),
 )
-def update_poincare_graph(subject_code):
+def update_poincare_graph(subject_code: str) -> go.Figure:
+    """Seçilen subject için Poincaré scatter grafiğini çizer."""
     data = get_poincare_data(subject_code)
 
     fig = go.Figure()
@@ -509,7 +455,8 @@ def update_poincare_graph(subject_code):
     Output("poincare-metrics", "children"),
     Input("subject-dropdown", "value"),
 )
-def update_poincare_metrics(subject_code):
+def update_poincare_metrics(subject_code: str):
+    """Seçilen subject için SD1 / SD2 / oran / stress index kartlarını günceller."""
     data = get_poincare_data(subject_code)
 
     sd1 = data["sd1"]
@@ -530,10 +477,8 @@ def update_poincare_metrics(subject_code):
     Output("subject-info", "children"),
     Input("subject-dropdown", "value"),
 )
-def update_subject_info(subject_code):
-    """
-    Seçilen subject için yaş / cinsiyet / grup bilgisini gösterir.
-    """
+def update_subject_info(subject_code: str):
+    """Seçilen subject için yaş / cinsiyet / grup bilgisini gösterir."""
     info = get_subject_info(subject_code)
 
     age = info.get("age")
@@ -546,9 +491,8 @@ def update_subject_info(subject_code):
     elif isinstance(age, float) and age != age:  # NaN kontrolü
         age_str = "Unknown"
     else:
-        # 53.0 -> 53
         if isinstance(age, (int, float)):
-            age_str = str(int(age))
+            age_str = str(int(age))  # 53.0 -> "53"
         else:
             age_str = str(age)
 
@@ -563,6 +507,27 @@ def update_subject_info(subject_code):
         html.Br(),
         html.Span(f"Age: {age_str} · Sex: {sex_str}{group_str}"),
     ]
+
+
+@app.callback(
+    Output("status-text", "children"),
+    Output("signal-quality-text", "children"),
+    Input("subject-dropdown", "value"),
+)
+def update_status_bar(subject_code: str):
+    """
+    Seçilen subject için alt bardaki status ve signal quality metnini günceller.
+    Tamamen sinyal kalitesine yönelik teknik bir değerlendirmedir.
+    """
+    status = get_signal_status(subject_code)
+
+    status_text = status.get("status_text", "Status unavailable")
+    quality_label = status.get("quality_label", "Unknown")
+    outlier_percent = status.get("outlier_percent", 0.0)
+
+    quality_str = f"Signal quality: {quality_label} · Irregular RR: {outlier_percent:.1f}% · Source: recorded RR file"
+
+    return status_text, quality_str
 
 
 if __name__ == "__main__":

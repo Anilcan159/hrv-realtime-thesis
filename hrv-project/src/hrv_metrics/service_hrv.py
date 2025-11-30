@@ -368,3 +368,67 @@ def get_subject_info(subject_code: str) -> dict:
 
 
 
+def _compute_signal_quality(rr: np.ndarray) -> dict:
+    """
+    RR serisinden basit bir sinyal kalite özeti üretir.
+    Bu sadece teknik bir kalite değerlendirmesidir, klinik/medikal yorum değildir.
+    """
+    rr = np.asarray(rr, dtype=float)
+    n_total = rr.size
+
+    if n_total == 0:
+        return {
+            "quality_label": "No data",
+            "status_text": "No RR intervals available",
+            "outlier_percent": 100.0,
+            "n_total": 0,
+            "n_outliers": 0,
+        }
+
+    # Basit aralık kontrolü (saniye cinsinden)
+    lower, upper = 0.3, 2.0
+    mask_range = (rr < lower) | (rr > upper)
+
+    # Ardışık farklar
+    diff = np.abs(np.diff(rr))
+    jump_threshold = 0.3  # 300 ms
+    jump_mask = diff > jump_threshold
+
+    n_out_of_range = int(mask_range.sum())
+    n_big_jumps = int(jump_mask.sum())
+    n_outliers = n_out_of_range + n_big_jumps
+
+    outlier_percent = (n_outliers / n_total) * 100.0 if n_total > 0 else 0.0
+
+    # Kısa kayıt kontrolü
+    if n_total < 10:
+        quality_label = "Short recording"
+        status_text = "Recording too short for stable HRV estimation"
+    else:
+        # Çok kabaca 3 seviye
+        if outlier_percent < 1.0:
+            quality_label = "OK"
+            status_text = "Normal (no alerts detected in the last window)"
+        elif outlier_percent < 5.0:
+            quality_label = "Moderate"
+            status_text = f"Check signal (≈{outlier_percent:.1f}% irregular RR intervals)"
+        else:
+            quality_label = "Poor"
+            status_text = f"Low signal quality (≈{outlier_percent:.1f}% irregular RR intervals)"
+
+    return {
+        "quality_label": quality_label,
+        "status_text": status_text,
+        "outlier_percent": float(outlier_percent),
+        "n_total": int(n_total),
+        "n_outliers": int(n_outliers),
+    }
+
+
+def get_signal_status(subject_code: str) -> dict:
+    """
+    Dashboard için sinyal kalite özeti.
+    İlgili subject'in RR serisini okur ve _compute_signal_quality kullanır.
+    """
+    rr = load_rr_from_csv(subject_code)
+    return _compute_signal_quality(rr)
