@@ -6,6 +6,7 @@ from scipy.interpolate import CubicSpline
 from scipy.signal import welch
 
 from src.streaming.rr_buffer import GLOBAL_RR_BUFFER
+LIVE_ONLY = True  # dashboard demo modunda CSV fallback kapalı
 
 
 
@@ -40,13 +41,16 @@ def get_available_subject_codes():
 
 # -------------------- RR KAYNAĞI -------------------- #
 def load_rr(subject_code: str, window_length_s: float | None = None) -> np.ndarray:
-    # Prefers live buffer, falls back to CSV
     rr_live = GLOBAL_RR_BUFFER.get_rr_sec(subject_code, window_s=window_length_s)
     if rr_live and len(rr_live) >= 2:
         return np.asarray(rr_live, dtype=float)
 
+    if LIVE_ONLY:
+        return np.asarray([], dtype=float)   # CSV'ye düşme!
+
     rr = load_rr_from_csv(subject_code)
     return _apply_time_window(rr, window_length_s)
+
 
 
 

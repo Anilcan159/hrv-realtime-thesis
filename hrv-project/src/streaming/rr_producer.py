@@ -1,4 +1,4 @@
-# Sends RR intervals to Kafka topic rr-stream (CSV replay as real-time)
+# Multi-subject RR producer (round-robin streaming)
 import json
 import time
 from pathlib import Path
@@ -9,6 +9,9 @@ from kafka import KafkaProducer
 
 BOOTSTRAP = "localhost:9092"
 TOPIC = "rr-stream"
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+RR_DIR = ROOT_DIR / "data" / "processed" / "rr_clean"
 
 def load_rr_ms(csv_path: Path) -> np.ndarray:
     df = pd.read_csv(csv_path)
@@ -21,11 +24,22 @@ def load_rr_ms(csv_path: Path) -> np.ndarray:
     rr_ms = rr_ms[np.isfinite(rr_ms)]
     return rr_ms
 
-def main(subject: str = "000", loop: bool = True):
-    root_dir = Path(__file__).resolve().parents[2]  # hrv-project
-    csv_path = root_dir / "data" / "processed" / "rr_clean" / f"{subject}_clean.csv"
+def find_subjects(limit: int = 8) -> list[str]:
+    codes = []
+    for p in RR_DIR.glob("*_clean.csv"):
+        code = p.stem.replace("_clean", "")
+        codes.append(code)
+    codes = sorted(codes, key=lambda x: int(x) if x.isdigit() else 999999)
+    return codes[:limit]
 
-    rr_ms = load_rr_ms(csv_path)
+def main(subjects: list[str] | None = None, loop: bool = True, min_sleep_s: float = 0.05):
+    if subjects is None:
+        subjects = find_subjects(limit=8)
+
+    series = []
+    for s in subjects:
+        csv_path = RR_DIR / f"{s}_clean.csv"
+        series.append((s, load_rr_ms(csv_path), 0))  # (subject, rr_ms_array, idx)
 
     producer = KafkaProducer(
         bootstrap_servers=BOOTSTRAP,
@@ -33,27 +47,38 @@ def main(subject: str = "000", loop: bool = True):
         acks=1,
     )
 
-    print(f"Producing {rr_ms.size} RR samples to {TOPIC} (subject={subject}, loop={loop}) ...")
+    print(f"Producing subjects={subjects} to {TOPIC} (loop={loop}) ...")
 
-    sent = 0
     try:
         while True:
-            for rr in rr_ms:
-                msg = {"subject": subject, "ts": time.time(), "rr_ms": float(rr)}
+            # Round-robin: her subject'ten bir sample
+            any_active = False
+
+            new_series = []
+            for subject, rr_ms_arr, idx in series:
+                if idx >= rr_ms_arr.size:
+                    if loop:
+                        idx = 0
+                    else:
+                        new_series.append((subject, rr_ms_arr, idx))
+                        continue
+
+                rr = float(rr_ms_arr[idx])
+                msg = {"subject": subject, "ts": time.time(), "rr_ms": rr}
                 producer.send(TOPIC, msg)
-                sent += 1
+                any_active = True
 
-                # flush'u her mesajda yapma (yavaşlatır)
-                if sent % 200 == 0:
-                    producer.flush()
+                # aynı anda 8 subject akarken "gerçek zaman" birebir olmaz;
+                # ama dashboard demo için yeter: her subject düzenli update alır
+                time.sleep(max(rr / 1000.0 / max(len(series), 1), min_sleep_s))
 
-                time.sleep(max(float(rr) / 1000.0, 0.05))
+                new_series.append((subject, rr_ms_arr, idx + 1))
 
+            series = new_series
             producer.flush()
-            if not loop:
-                break
 
-            print("Looping CSV from start...")
+            if not any_active:
+                break
 
     finally:
         try:
@@ -64,5 +89,4 @@ def main(subject: str = "000", loop: bool = True):
         print("Done.")
 
 if __name__ == "__main__":
-    # basit kullanım: istersen burada subject'i değiştir
-    main(subject="000", loop=True)
+    main(subjects=None, loop=True)
