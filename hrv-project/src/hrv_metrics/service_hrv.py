@@ -1,11 +1,13 @@
 # src/hrv_metrics/service_hrv.py
-
 from pathlib import Path
-import json
 import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
 from scipy.signal import welch
+
+from src.streaming.rr_buffer import GLOBAL_RR_BUFFER
+
+
 
 # Proje kökü: .../hrv-project
 ROOT_DIR = Path(__file__).parents[2]
@@ -37,6 +39,16 @@ def get_available_subject_codes():
 
 
 # -------------------- RR KAYNAĞI -------------------- #
+def load_rr(subject_code: str, window_length_s: float | None = None) -> np.ndarray:
+    # Prefers live buffer, falls back to CSV
+    rr_live = GLOBAL_RR_BUFFER.get_rr_sec(subject_code, window_s=window_length_s)
+    if rr_live and len(rr_live) >= 2:
+        return np.asarray(rr_live, dtype=float)
+
+    rr = load_rr_from_csv(subject_code)
+    return _apply_time_window(rr, window_length_s)
+
+
 
 def load_rr_from_csv(subject_code: str) -> np.ndarray:
     """
@@ -311,20 +323,11 @@ def get_freq_domain_metrics(
     window_length_s: float | None = None,
     fs_resample: float = 4.0,
 ) -> dict:
-    """
-    Belirli bir subject için frekans-domeni HRV metriklerini hesaplar
-    (Welch yöntemi).
-
-    - RR saniye cinsinden okunur
-    - window_length_s verilirse, sadece SON pencere kullanılır
-    - Sonra _compute_freq_domain_from_rr ile PSD + band güçleri hesaplanır
-    """
-    rr = load_rr_from_csv(subject_code)          # saniye cinsinden RR
-    rr = _apply_time_window(rr, window_length_s)  # None ise tüm kayıt
-
+    rr = load_rr(subject_code, window_length_s=window_length_s)
     fd = _compute_freq_domain_from_rr(rr, fs_resample=fs_resample)
     fd["window_length_s"] = window_length_s
     return fd
+
 
 
 
@@ -339,27 +342,14 @@ def get_hr_timeseries(
     max_points: int = 500,
     window_length_s: float | None = None,
 ):
-    """
-    Belirli bir denek için RR serisinden HR (bpm) zaman serisi üretir.
-    - RR saniye cinsinden.
-    - Eğer window_length_s verilirse sadece son pencere kullanılır.
-    - Zaman ekseni: seçilen pencere için kümülatif RR (0'dan başlatılır).
-    """
-    rr = load_rr_from_csv(subject_code)
-
-    # 5 dakikalık (veya verilen) pencere uygula
-    rr = _apply_time_window(rr, window_length_s)
+    rr = load_rr(subject_code, window_length_s=window_length_s)
 
     if rr.size < 1:
         return [], []
 
-    # Zaman ekseni: seçilen pencere için kümülatif zaman (saniye)
     t_sec = np.cumsum(rr)
-
-    # Kalp hızı: bpm
     hr_bpm = 60.0 / rr
 
-    # Çok uzun serileri ekran için kısalt (son max_points örnek)
     if t_sec.size > max_points:
         t_sec = t_sec[-max_points:]
         hr_bpm = hr_bpm[-max_points:]
@@ -368,42 +358,22 @@ def get_hr_timeseries(
 
 
 
-
 def get_time_domain_metrics(
     subject_code: str = "000",
     window_length_s: float | None = None,
 ) -> dict:
-    """
-    Belirli bir subject için time-domain HRV metriklerini hesaplar.
-
-    - RR serisi saniye cinsinden okunur.
-    - Eğer window_length_s verilirse, bu sürelik son pencere kullanılır
-      (örneğin 300 s = son 5 dakika).
-    - Metrikler _compute_time_domain_from_rr fonksiyonundan gelir.
-    """
-    rr = load_rr_from_csv(subject_code)  # saniye cinsinden
-    rr = _apply_time_window(rr, window_length_s)
-
+    rr = load_rr(subject_code, window_length_s=window_length_s)
     td = _compute_time_domain_from_rr(rr)
     td["window_length_s"] = window_length_s
     return td
+
 
 def get_poincare_data(
     subject_code: str,
     max_points: int = 1000,
     window_length_s: float | None = None,
 ) -> dict:
-    """
-    Poincaré diyagramı için:
-    - RR_n ve RR_{n+1} (ms cinsinden)
-    - SD1, SD2, SD1/SD2 oranı ve basit bir stress index döner.
-
-    Eğer window_length_s verilirse, sadece son window_length_s saniyeye
-    düşen RR intervalleri kullanılır.
-    """
-    rr = load_rr_from_csv(subject_code)  # saniye cinsinden RR
-
-    rr = _apply_time_window(rr, window_length_s)
+    rr = load_rr(subject_code, window_length_s=window_length_s)
 
     if rr.size < 3:
         return {
@@ -415,26 +385,21 @@ def get_poincare_data(
             "stress_index": float("nan"),
         }
 
-    # ms'e çevir
     rr_ms = rr * 1000.0
-
-    # Poincaré noktaları: RR_n (x), RR_{n+1} (y)
     x = rr_ms[:-1]
     y = rr_ms[1:]
 
-    # Çok uzun serilerde son max_points noktayı al
     if x.size > max_points:
         x = x[-max_points:]
         y = y[-max_points:]
 
-    # SD1 / SD2 hesapları (Task Force formülleri)
-    sdnn = float(np.std(rr_ms, ddof=1))              # tüm RR'nin std'si (ms)
-    diff_ms = np.diff(rr_ms)                         # ardışık farklar
+    sdnn = float(np.std(rr_ms, ddof=1))
+    diff_ms = np.diff(rr_ms)
     var_diff = float(np.var(diff_ms, ddof=1))
 
-    sd1 = float(np.sqrt(0.5 * var_diff))            # sd1
+    sd1 = float(np.sqrt(0.5 * var_diff))
     sd2_inside = 2.0 * (sdnn ** 2) - 0.5 * var_diff
-    sd2 = float(np.sqrt(max(sd2_inside, 0.0)))      # sd2
+    sd2 = float(np.sqrt(max(sd2_inside, 0.0)))
 
     sd1_sd2_ratio = float(sd1 / sd2) if sd2 > 0 else float("nan")
     stress_index = float(sd2 / sd1) if sd1 > 0 else float("nan")
@@ -447,7 +412,6 @@ def get_poincare_data(
         "sd1_sd2_ratio": sd1_sd2_ratio,
         "stress_index": stress_index,
     }
-
 
 
 def get_subject_info(subject_code: str) -> dict:
@@ -576,10 +540,7 @@ def _compute_signal_quality(rr: np.ndarray) -> dict:
     }
 
 
-def get_signal_status(subject_code: str) -> dict:
-    """
-    Dashboard için sinyal kalite özeti.
-    İlgili subject'in RR serisini okur ve _compute_signal_quality kullanır.
-    """
-    rr = load_rr_from_csv(subject_code)
+def get_signal_status(subject_code: str, window_length_s: float | None = None) -> dict:
+    rr = load_rr(subject_code, window_length_s=window_length_s)
     return _compute_signal_quality(rr)
+
