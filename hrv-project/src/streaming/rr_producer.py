@@ -1,6 +1,17 @@
+# src/streaming/rr_producer.py
 # Multi-subject RR producer (round-robin streaming)
 """
 Streams cleaned RR series for multiple subjects to Kafka in a round-robin fashion.
+
+Data source:
+    settings.paths.rr_processed_dir  ->  *_clean.csv per subject
+
+Kafka:
+    settings.kafka.bootstrap_servers
+    settings.kafka.rr_topic
+
+Logging:
+    Logs are written to logs/producer.log via project-wide logging utilities.
 """
 
 import json
@@ -13,13 +24,13 @@ import numpy as np
 import pandas as pd
 from kafka import KafkaProducer
 
-# --- ensure project root is on sys.path ---
+# --- ensure project root is on sys.path (so `src.*` imports work when run as script) ---
 ROOT_DIR = Path(__file__).resolve().parents[2]  # .../hrv-project
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from src.config.settings import settings
-
+from src.utils.logging_utils import get_logger
 
 
 # Config-driven paths and Kafka parameters
@@ -29,6 +40,9 @@ KAFKA_TOPIC: str = settings.kafka.rr_topic
 
 # Ust limit for concurrently streamed subjects (demo-friendly)
 DEFAULT_SUBJECT_LIMIT: int = 8
+
+# Module-level logger
+logger = get_logger(module_name="rr_producer", logfile_name="producer.log")
 
 
 def load_rr_ms(csv_path: Path) -> np.ndarray:
@@ -50,7 +64,9 @@ def load_rr_ms(csv_path: Path) -> np.ndarray:
     elif "rr_ms" in df.columns:
         rr_ms = df["rr_ms"].to_numpy(dtype=float)
     else:
-        raise ValueError(f"RR column not found in {csv_path}. Columns={list(df.columns)}")
+        raise ValueError(
+            f"RR column not found in {csv_path}. Columns={list(df.columns)}"
+        )
 
     rr_ms = rr_ms[np.isfinite(rr_ms)]
     return rr_ms
@@ -105,27 +121,35 @@ def main(
         subjects = find_subjects(limit=DEFAULT_SUBJECT_LIMIT)
 
     if not subjects:
-        print("[rr_producer] no subjects found in rr_clean directory.")
+        logger.warning("No subjects found in rr_clean directory.")
         return
 
     series: List[Tuple[str, np.ndarray, int]] = []
     for s in subjects:
         csv_path = RR_DIR / f"{s}_clean.csv"
         if not csv_path.exists():
-            print(f"[rr_producer] warning: file not found for subject {s}: {csv_path}")
+            logger.warning("RR file not found for subject %s: %s", s, csv_path)
             continue
 
         rr_ms = load_rr_ms(csv_path)
         if rr_ms.size == 0:
-            print(f"[rr_producer] warning: empty RR series for subject {s}")
+            logger.warning("Empty RR series for subject %s (file=%s)", s, csv_path)
             continue
 
         # (subject_code, rr_ms_array, current_index)
         series.append((s, rr_ms, 0))
 
     if not series:
-        print("[rr_producer] no valid RR series to stream, exiting.")
+        logger.error("No valid RR series to stream. Exiting producer.")
         return
+
+    logger.info(
+        "Starting producer with subjects=%s, topic='%s', bootstrap_servers='%s', loop=%s",
+        [s for s, _, _ in series],
+        KAFKA_TOPIC,
+        KAFKA_BOOTSTRAP,
+        loop,
+    )
 
     producer = KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -133,17 +157,12 @@ def main(
         acks=1,
     )
 
-    print(
-        f"[rr_producer] Producing subjects={ [s for s, _, _ in series] } "
-        f"to topic='{KAFKA_TOPIC}' (loop={loop}) ..."
-    )
-
     try:
         while True:
             any_active = False
             new_series: List[Tuple[str, np.ndarray, int]] = []
 
-            # round-robin: send one RR sample per subject per cycle
+            # Round-robin: send one RR sample per subject per cycle
             for subject, rr_ms_arr, idx in series:
                 if idx >= rr_ms_arr.size:
                     if loop:
@@ -169,15 +188,25 @@ def main(
 
             if not any_active:
                 # All subjects exhausted and loop=False
+                logger.info("All subject series exhausted (loop=False). Stopping producer loop.")
                 break
+
+    except Exception as e:
+        logger.error("Unexpected error in producer loop: %r", e, exc_info=True)
+        raise
 
     finally:
         try:
             producer.flush()
         except Exception:
-            pass
-        producer.close()
-        print("[rr_producer] Done.")
+            logger.warning("Error while flushing producer during shutdown.", exc_info=True)
+
+        try:
+            producer.close()
+        except Exception:
+            logger.warning("Error while closing KafkaProducer.", exc_info=True)
+
+        logger.info("Producer shutdown complete.")
 
 
 if __name__ == "__main__":

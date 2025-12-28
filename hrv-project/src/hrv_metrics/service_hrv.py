@@ -17,9 +17,13 @@ Konfigürasyon:
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from src.utils.logging_utils import get_logger
 
 import numpy as np
 import pandas as pd
+logger = get_logger(module_name="hrv_service", logfile_name="hrv_service.log")
+from typing import Dict, Any  
+
 from scipy.interpolate import CubicSpline
 from scipy.signal import welch
 
@@ -36,28 +40,30 @@ PATIENT_INFO_PATH: Path = settings.paths.patient_info_path
 RR_DIR: Path = settings.paths.rr_processed_dir
 
 
-def get_available_subject_codes() -> List[str]:
+def get_available_subject_codes():
     """
     rr_clean klasöründeki *_clean.csv dosyalarından subject_code listesini üretir.
     Örn: 000_clean.csv -> '000'
-
-    Dönüş:
-        Sayısal sıraya göre sıralanmış subject code listesi (str).
     """
-    codes: List[str] = []
+    codes = []
     for path in RR_DIR.glob("*_clean.csv"):
         code = path.stem.replace("_clean", "")
         codes.append(code)
 
-    # sayısal sıraya göre sırala (000, 002, 003, 005, 401, ...)
-    def _sort_key(c: str) -> int:
+    # sayısal sıraya göre sırala (000,002,003,005,401,...)
+    def _sort_key(c):
         try:
             return int(c)
         except ValueError:
-            return 999_999  # numara olmayanları sona at
+            return 999999  # numara olmayanları sona at
 
     codes = sorted(codes, key=_sort_key)
+
+    if not codes:
+        logger.warning("No *_clean.csv files found in RR_DIR=%s", RR_DIR)
+
     return codes
+
 
 
 # -------------------- RR KAYNAĞI -------------------- #
@@ -98,29 +104,32 @@ def load_rr(subject_code: str, window_length_s: Optional[float] = None) -> np.nd
 def load_rr_from_csv(subject_code: str) -> np.ndarray:
     """
     Belirli bir denek için RR serisini CSV'den okur.
-
-    subject_code:
-        "000", "002", "401" vb.
-
-    Beklenen dosya adı:
-        {subject_code}_clean.csv
-
-    Beklenen kolonlar:
-        - 'rr'    : saniye (direct use)
-        - 'rr_ms' : milisaniye, saniyeye çevrilir (rr_ms / 1000)
+    subject_code: '000', '002', '401' gibi.
+    Beklenen dosya adı: 000_clean.csv, 002_clean.csv, 401_clean.csv ...
     """
     csv_path = RR_DIR / f"{subject_code}_clean.csv"
 
     if not csv_path.exists():
+        logger.error("RR file not found for subject=%s: %s", subject_code, csv_path)
         raise FileNotFoundError(f"RR file not found: {csv_path}")
 
     df = pd.read_csv(csv_path)
 
+    # BURADA BİR VARSAYIM YAPIYORUM:
+    #   - Eğer kolon adı 'rr' ise direkt alıyoruz
+    #   - Eğer 'rr_ms' ise saniyeye çeviriyoruz (ms / 1000)
+    # Eğer sende farklı isimse (örneğin 'RR_interval_ms') sadece aşağıdaki kısmı değiştirmen yeter.
     if "rr" in df.columns:
         rr_sec = df["rr"].to_numpy(dtype=float)
     elif "rr_ms" in df.columns:
         rr_sec = df["rr_ms"].to_numpy(dtype=float) / 1000.0
     else:
+        logger.error(
+            "RR column not found in %s for subject=%s. Expected 'rr' or 'rr_ms'. Columns=%s",
+            csv_path,
+            subject_code,
+            list(df.columns),
+        )
         raise ValueError(
             f"RR column not found in {csv_path}. "
             f"Expected one of: 'rr', 'rr_ms'. "
@@ -128,6 +137,7 @@ def load_rr_from_csv(subject_code: str) -> np.ndarray:
         )
 
     return rr_sec
+
 
 
 # -------------------- TIME-DOMAIN HESAP -------------------- #
@@ -513,7 +523,9 @@ def get_poincare_data(
     }
 
 
-def get_subject_info(subject_code: str) -> Dict[str, object]:
+from typing import Dict, Any  # dosyanın üstünde varsa tekrar ekleme
+
+def get_subject_info(subject_code: str) -> Dict[str, Any]:
     """
     Demografik bilgiler: age / sex / group (child/adult/older).
 
@@ -530,17 +542,30 @@ def get_subject_info(subject_code: str) -> Dict[str, object]:
             names=["code", "age", "sex"],
         )
     except FileNotFoundError:
+        logger.warning(
+            "Patient info CSV not found at %s. Returning empty demographics for subject=%s",
+            PATIENT_INFO_PATH,
+            subject_code,
+        )
         return {"code": subject_code, "age": None, "sex": None, "group": None}
 
+    # Olası header satırlarını (code/File) at
     df["code"] = df["code"].astype(str)
     mask_header = df["code"].str.lower().isin(["code", "file"])
     df = df[~mask_header]
 
     if df.empty:
+        logger.warning(
+            "Patient info CSV at %s is empty after header filtering. subject=%s",
+            PATIENT_INFO_PATH,
+            subject_code,
+        )
         return {"code": subject_code, "age": None, "sex": None, "group": None}
 
+    # code kolonunu sayıya çevir (0, 2, 401 vs.)
     df["code"] = pd.to_numeric(df["code"], errors="coerce")
 
+    # subject_code -> int (örn. "000" -> 0)
     try:
         code_int = int(subject_code)
     except ValueError:
@@ -549,14 +574,21 @@ def get_subject_info(subject_code: str) -> Dict[str, object]:
     if code_int is not None:
         row = df[df["code"] == code_int]
     else:
+        # Sayıya çevrilemiyorsa fallback string karşılaştırma
         row = df[df["code"].astype(str) == str(subject_code)]
 
     if row.empty:
+        logger.warning(
+            "No matching patient info row for subject_code=%s in %s",
+            subject_code,
+            PATIENT_INFO_PATH,
+        )
         return {"code": subject_code, "age": None, "sex": None, "group": None}
 
     age = row.iloc[0]["age"]
     sex = row.iloc[0]["sex"]
 
+    # Yaşa göre grup (sadece gerçekten sayıysa)
     try:
         age_val = float(age)
     except (TypeError, ValueError):
@@ -568,10 +600,12 @@ def get_subject_info(subject_code: str) -> Dict[str, object]:
         group = "Child / adolescent"
     elif age_val < 65:
         group = "Adult"
+        # buradaki eşikler istersen settings.hrv içinde parametrelenebilir
     else:
         group = "Older adult"
 
     return {"code": subject_code, "age": age, "sex": sex, "group": group}
+
 
 
 def _compute_signal_quality(rr: np.ndarray) -> Dict[str, object]:

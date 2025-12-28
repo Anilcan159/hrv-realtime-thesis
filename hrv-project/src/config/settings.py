@@ -1,21 +1,33 @@
 # src/config/settings.py
+"""
+Central application configuration for the HRV realtime project.
+
+Tüm sabitler ve parametreler:
+    - Kafka ayarları
+    - Dosya yolları
+    - HRV preprocessing ve analiz parametreleri
+    - Dashboard ile ilgili sınırlar
+
+Buradan okunur:
+    from src.config.settings import settings
+"""
+
+import os
 from dataclasses import dataclass
 from pathlib import Path
-import os
+from typing import Tuple
 
-# Proje kökü
+
+# Proje kökü: .../hrv-project
 BASE_DIR = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
-class KafkaSettings:
-    bootstrap_servers: str = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
-    rr_topic: str = os.getenv("KAFKA_RR_TOPIC", "rr-stream")
-    group_id: str = os.getenv("KAFKA_GROUP_ID", "hrv-consumer")
-
-
-@dataclass(frozen=True)
 class PathSettings:
+    """
+    Dosya ve klasör yolları.
+    """
+
     base_dir: Path = BASE_DIR
     raw_data_dir: Path = (
         BASE_DIR
@@ -31,36 +43,73 @@ class PathSettings:
 
 
 @dataclass(frozen=True)
+class KafkaSettings:
+    """
+    Kafka bağlantı ayarları.
+
+    Ortam değişkenleri:
+        KAFKA_BOOTSTRAP
+        KAFKA_RR_TOPIC
+        KAFKA_GROUP_ID
+    """
+
+    bootstrap_servers: str = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+    rr_topic: str = os.getenv("KAFKA_RR_TOPIC", "rr-stream")
+    group_id: str = os.getenv("KAFKA_GROUP_ID", "hrv-consumer")
+
+
+@dataclass(frozen=True)
 class HRVSettings:
-    # streaming / buffer
-    rr_max_age_s: float = float(os.getenv("RR_MAX_AGE_S", 10 * 60.0))
+    """
+    HRV preprocessing + analiz parametreleri.
+    """
 
-    # time-domain temizleme parametreleri
-    rr_min_ms: int = int(os.getenv("HRV_RR_MIN_MS", 300))
-    rr_max_ms: int = int(os.getenv("HRV_RR_MAX_MS", 2000))
-    max_gap_beats: int = int(os.getenv("HRV_MAX_GAP_BEATS", 3))
+    # Fizyolojik RR sınırları (ms)
+    rr_min_ms: int = 300
+    rr_max_ms: int = 2000
 
-    # freq-domain
-    fs_resample: float = float(os.getenv("HRV_FS_RESAMPLE", 4.0))
-    vlf_band: tuple[float, float] = (0.0033, 0.04)
-    lf_band: tuple[float, float] = (0.04, 0.15)
-    hf_band: tuple[float, float] = (0.15, 0.40)
+    # Kısa boşluk (beat sayısı) interpolasyon sınırı
+    max_gap_beats: int = 3
+
+    # Bellekte tutulacak maksimum RR geçmişi (saniye)
+    rr_max_age_s: float = 10 * 60.0
+
+    # Frekans-domeni yeniden örnekleme frekansı (Hz)
+    fs_resample: float = 4.0
+
+    # Spektral band sınırları (Hz)
+    vlf_band: Tuple[float, float] = (0.0033, 0.04)
+    lf_band: Tuple[float, float] = (0.04, 0.15)
+    hf_band: Tuple[float, float] = (0.15, 0.40)
 
 
 @dataclass(frozen=True)
 class DashboardSettings:
-    default_window_s: float = 5 * 60.0  # “Last 5 minutes”
+    """
+    Dashboard ile ilgili varsayılan ayarlar.
+    """
+
+    # "Last 5 minutes" penceresi
+    default_window_s: float = 5 * 60.0
+
+    # HR time-series grafiğinde tutulacak maksimum nokta
     max_hr_points: int = 500
+
+    # Poincaré scatter için maksimum nokta
     max_poincare_points: int = 1000
 
 
 @dataclass(frozen=True)
 class AppSettings:
-    kafka: KafkaSettings = KafkaSettings()
+    """
+    Uygulamanın tüm config'lerinin birleşimi.
+    """
+
     paths: PathSettings = PathSettings()
+    kafka: KafkaSettings = KafkaSettings()
     hrv: HRVSettings = HRVSettings()
     dashboard: DashboardSettings = DashboardSettings()
 
 
-# Uygulama genelinde kullanılacak tek entry point
+# Tek global config objesi
 settings = AppSettings()
