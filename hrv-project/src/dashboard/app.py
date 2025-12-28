@@ -249,15 +249,27 @@ app.layout = html.Div(
                 html.Div(
                     style=PANEL_STYLE,
                     children=[
-                        html.H3("Frequency-domain metrics"),
+                        html.H3("Frequency-domain metrics", style={"marginBottom": "5px"}),
                         html.Span(
-                            "LF / HF power and band distribution",
+                            "Spectral power (Welch) and VLF / LF / HF distribution",
                             style={"fontSize": "12px", "color": "#A0AEC0"},
                         ),
-                        dcc.Graph(id="lf-hf-graph", style={"height": "230px"}),
-                        dcc.Graph(id="band-pie-graph", style={"height": "220px"}),
+                        html.Div(
+                            style={
+                                "display": "grid",
+                                "gridTemplateColumns": "1.6fr 1fr",
+                                "gridGap": "10px",
+                                "marginTop": "10px",
+                                "alignItems": "stretch",
+                            },
+                            children=[
+                                dcc.Graph(id="lf-hf-graph", style={"height": "260px"}),
+                                dcc.Graph(id="band-pie-graph", style={"height": "260px"}),
+                            ],
+                        ),
                     ],
                 ),
+
                 html.Div(
                     style=PANEL_STYLE,
                     children=[
@@ -423,10 +435,11 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
         "HF": HF_BAND,
     }
     colors = {
-        "VLF": "rgba(56, 161, 105, 0.25)",
-        "LF": "rgba(66, 153, 225, 0.25)",
-        "HF": "rgba(237, 100, 166, 0.25)",
+        "VLF": "rgba(56, 161, 105, 0.35)",   # biraz daha opak
+        "LF": "rgba(66, 153, 225, 0.35)",
+        "HF": "rgba(237, 100, 166, 0.35)",
     }
+
 
     shapes = []
     for name, (f_low, f_high) in bands.items():
@@ -440,7 +453,7 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
                 y0=0,
                 y1=max_psd * 1.05,
                 fillcolor=colors[name],
-                opacity=0.25,
+                opacity=0.35,
                 line=dict(width=0),
                 layer="below",
             )
