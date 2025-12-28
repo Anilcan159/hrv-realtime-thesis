@@ -3,13 +3,15 @@ import sys
 import numpy as np
 from dash import Dash, html, dcc, Input, Output
 import plotly.graph_objects as go
+import requests 
 
-# Ensure project root is on sys.path (so imports work even if run from src/dashboard)
-CURRENT_DIR = os.path.dirname(__file__)          # .../src/dashboard
-PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))  # .../ (hrv-project)
+# --- PROJE KÖKÜNÜ sys.path'E EKLE (ÖNCE BUNU YAP) --- #
+CURRENT_DIR = os.path.dirname(__file__)                  # .../src/dashboard
+PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))  # .../hrv-project
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
+# Artık src.* importları güvenli
 from src.config.settings import settings
 from src.hrv_metrics.service_hrv import (
     get_time_domain_metrics,
@@ -20,10 +22,8 @@ from src.hrv_metrics.service_hrv import (
     get_freq_domain_metrics,
     get_signal_status,
 )
-
-# Start Kafka consumer in the SAME process as Dash
 from src.streaming.rr_consumer import start_consumer_background
-start_consumer_background()
+
 
 app = Dash(__name__)
 
@@ -38,6 +38,24 @@ PANEL_STYLE = {
     "flexDirection": "column",
     "gap": "12px",
 }
+
+
+def _fetch_from_api(path: str, params: dict) -> dict:
+    """
+    FastAPI HRV servisinden JSON veri çeker.
+    Hata olursa bos dict dondurur.
+    """
+    base_url = settings.api.base_url.rstrip("/")
+    url = f"{base_url}{path}"
+    try:
+        resp = requests.get(url, params=params, timeout=1.0)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        # Buraya istersen logging de ekleyebilirsin
+        print(f"[dashboard] API request failed: {e} (url={url}, params={params})")
+        return {}
+
 
 # Config-driven defaults (dashboard-level)
 DEFAULT_WINDOW_S = settings.dashboard.default_window_s  # e.g. 5 * 60
@@ -303,8 +321,14 @@ app.layout = html.Div(
 )
 def update_metrics_grid(n, subject_code, window_value):
     window_s = _window_to_seconds(window_value)
-    metrics = get_time_domain_metrics(subject_code, window_length_s=window_s)
-
+    # 1) API'den dene
+    params = {"subject": subject_code}
+    if window_s is not None:
+        params["window_s"] = window_s
+    metrics = _fetch_from_api("/metrics/time", params)
+    # 2) API bos donerse (hata vs.), eski lokal fonksiyona fallback
+    if not metrics:
+        metrics = get_time_domain_metrics(subject_code, window_length_s=window_s)
     cards = [
         metric_card("SDNN", _fmt(metrics.get("sdnn"), 1), "ms"),
         metric_card("RMSSD", _fmt(metrics.get("rmssd"), 1), "ms"),
@@ -352,8 +376,14 @@ def update_hr_graph(n, subject_code, window_value):
 )
 def update_frequency_domain_graphs(n, subject_code, window_value):
     window_s = _window_to_seconds(window_value)
-    fd = get_freq_domain_metrics(subject_code, window_length_s=window_s)
 
+    params = {"subject": subject_code}
+    if window_s is not None:
+        params["window_s"] = window_s
+
+    fd = _fetch_from_api("/metrics/freq", params)
+    if not fd:
+        fd = get_freq_domain_metrics(subject_code, window_length_s=window_s)
     freq = np.array(fd.get("freq", []), dtype=float)
     psd = np.array(fd.get("psd", []), dtype=float)
     band_powers = fd.get("band_powers", {})
@@ -455,7 +485,15 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
 )
 def update_poincare_graph(n, subject_code, window_value):
     window_s = _window_to_seconds(window_value)
-    data = get_poincare_data(subject_code, window_length_s=window_s)
+
+    params = {"subject": subject_code}
+    if window_s is not None:
+        params["window_s"] = window_s
+
+    data = _fetch_from_api("/metrics/poincare", params)
+    if not data:
+        data = get_poincare_data(subject_code, window_length_s=window_s)
+
 
     fig = go.Figure()
     if data.get("x") and data.get("y"):
@@ -488,7 +526,15 @@ def update_poincare_graph(n, subject_code, window_value):
 )
 def update_poincare_metrics(n, subject_code, window_value):
     window_s = _window_to_seconds(window_value)
-    data = get_poincare_data(subject_code, window_length_s=window_s)
+
+    params = {"subject": subject_code}
+    if window_s is not None:
+        params["window_s"] = window_s
+
+    data = _fetch_from_api("/metrics/poincare", params)
+    if not data:
+        data = get_poincare_data(subject_code, window_length_s=window_s)
+
 
     cards = [
         metric_card("SD1", _fmt(data.get("sd1"), 1), "ms"),
@@ -542,7 +588,15 @@ def update_subject_info(n, subject_code):
 )
 def update_status_bar(n, subject_code, window_value):
     window_s = _window_to_seconds(window_value)
-    status = get_signal_status(subject_code, window_length_s=window_s)
+
+    params = {"subject": subject_code}
+    if window_s is not None:
+        params["window_s"] = window_s
+
+    status = _fetch_from_api("/metrics/status", params)
+    if not status:
+        status = get_signal_status(subject_code, window_length_s=window_s)
+
 
     quality_label = status.get("quality_label", "Unknown")
     status_text = status.get("status_text", "No status available")

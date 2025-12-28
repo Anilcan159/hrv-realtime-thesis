@@ -99,16 +99,24 @@ class DashboardSettings:
     max_poincare_points: int = 1000
 
 
+
+@dataclass(frozen=True)
+class ApiSettings:
+    """
+    HRV FastAPI servisi ayarlari.
+    """
+    base_url: str = os.getenv("HRV_API_BASE_URL", "http://127.0.0.1:8000")
+
+
 @dataclass(frozen=True)
 class AppSettings:
-    """
-    Uygulamanın tüm config'lerinin birleşimi.
-    """
-
     paths: PathSettings = PathSettings()
     kafka: KafkaSettings = KafkaSettings()
     hrv: HRVSettings = HRVSettings()
     dashboard: DashboardSettings = DashboardSettings()
+    api: ApiSettings = ApiSettings()  # <--- BURAYI EKLE
+
+
 
 
 # Tek global config objesi
