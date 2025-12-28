@@ -10,6 +10,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))  # .../ (hrv-projec
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
+from src.config.settings import settings
 from src.hrv_metrics.service_hrv import (
     get_time_domain_metrics,
     get_available_subject_codes,
@@ -37,6 +38,13 @@ PANEL_STYLE = {
     "flexDirection": "column",
     "gap": "12px",
 }
+
+# Config-driven defaults (dashboard-level)
+DEFAULT_WINDOW_S = settings.dashboard.default_window_s  # e.g. 5 * 60
+VLF_BAND = settings.hrv.vlf_band
+LF_BAND = settings.hrv.lf_band
+HF_BAND = settings.hrv.hf_band
+
 
 def metric_card(title: str, value: str, unit: str = "") -> html.Div:
     return html.Div(
@@ -68,12 +76,20 @@ def metric_card(title: str, value: str, unit: str = "") -> html.Div:
         ],
     )
 
-def _window_to_seconds(window_value: str | None) -> float | None:
-    if window_value == "last_5min":
-        return 5 * 60.0
-    return None  # full
 
-def _fmt(v, nd=1):
+def _window_to_seconds(window_value: str | None) -> float | None:
+    """
+    UI'dan gelen pencere seçimini (full / last_5min) saniye cinsine çevirir.
+
+    "last_5min" değeri, settings.dashboard.default_window_s üzerinden yönetilir.
+    """
+    if window_value == "last_5min":
+        return float(DEFAULT_WINDOW_S)
+    # "full" veya bilinmeyen değerler -> None (full buffer/recording)
+    return None
+
+
+def _fmt(v, nd: int = 1) -> str:
     try:
         if v is None:
             return "N/A"
@@ -82,6 +98,7 @@ def _fmt(v, nd=1):
         return f"{float(v):.{nd}f}"
     except Exception:
         return "N/A"
+
 
 app.layout = html.Div(
     style={
@@ -113,14 +130,25 @@ app.layout = html.Div(
                     ]
                 ),
                 html.Div(
-                    style={"minWidth": "260px", "display": "flex", "flexDirection": "column", "gap": "8px"},
+                    style={
+                        "minWidth": "260px",
+                        "display": "flex",
+                        "flexDirection": "column",
+                        "gap": "8px",
+                    },
                     children=[
                         html.Div(
                             children=[
-                                html.Label("Subject / Session", style={"fontSize": "12px", "marginBottom": "4px"}),
+                                html.Label(
+                                    "Subject / Session",
+                                    style={"fontSize": "12px", "marginBottom": "4px"},
+                                ),
                                 dcc.Dropdown(
                                     id="subject-dropdown",
-                                    options=[{"label": f"Subject {code}", "value": code} for code in subject_codes],
+                                    options=[
+                                        {"label": f"Subject {code}", "value": code}
+                                        for code in subject_codes
+                                    ],
                                     value=subject_codes[0] if subject_codes else None,
                                     clearable=False,
                                     style={"color": "#000000"},
@@ -129,12 +157,18 @@ app.layout = html.Div(
                         ),
                         html.Div(
                             children=[
-                                html.Label("Analysis window", style={"fontSize": "12px", "marginBottom": "4px"}),
+                                html.Label(
+                                    "Analysis window",
+                                    style={"fontSize": "12px", "marginBottom": "4px"},
+                                ),
                                 dcc.Dropdown(
                                     id="window-dropdown",
                                     options=[
                                         {"label": "Full recording", "value": "full"},
-                                        {"label": "Last 5 minutes", "value": "last_5min"},
+                                        {
+                                            "label": "Last 5 minutes",
+                                            "value": "last_5min",
+                                        },
                                     ],
                                     value="last_5min",  # canlıda default daha mantıklı
                                     clearable=False,
@@ -185,23 +219,27 @@ app.layout = html.Div(
                         html.Div(
                             style={"marginTop": "10px"},
                             children=[
-                                html.Span("Heart rate over time", style={"fontSize": "12px", "color": "#A0AEC0"}),
+                                html.Span(
+                                    "Heart rate over time",
+                                    style={"fontSize": "12px", "color": "#A0AEC0"},
+                                ),
                                 dcc.Graph(id="hr-graph", style={"height": "260px"}),
                             ],
                         ),
                     ],
                 ),
-
                 html.Div(
                     style=PANEL_STYLE,
                     children=[
                         html.H3("Frequency-domain metrics"),
-                        html.Span("LF / HF power and band distribution", style={"fontSize": "12px", "color": "#A0AEC0"}),
+                        html.Span(
+                            "LF / HF power and band distribution",
+                            style={"fontSize": "12px", "color": "#A0AEC0"},
+                        ),
                         dcc.Graph(id="lf-hf-graph", style={"height": "230px"}),
                         dcc.Graph(id="band-pie-graph", style={"height": "220px"}),
                     ],
                 ),
-
                 html.Div(
                     style=PANEL_STYLE,
                     children=[
@@ -213,7 +251,11 @@ app.layout = html.Div(
                         dcc.Graph(id="poincare-graph", style={"height": "260px"}),
                         html.Div(
                             id="poincare-metrics",
-                            style={"display": "grid", "gridTemplateColumns": "repeat(2, 1fr)", "gridGap": "10px"},
+                            style={
+                                "display": "grid",
+                                "gridTemplateColumns": "repeat(2, 1fr)",
+                                "gridGap": "10px",
+                            },
                             children=[],
                         ),
                     ],
@@ -225,7 +267,7 @@ app.layout = html.Div(
             style={
                 "backgroundColor": "#223459",
                 "borderRadius": "10px",
-                "padding": "10px 5px",  # FIXED
+                "padding": "10px 5px",
                 "display": "flex",
                 "justifyContent": "space-between",
                 "alignItems": "center",
@@ -235,7 +277,9 @@ app.layout = html.Div(
                     id="status-bar",
                     children=[
                         html.Span("Status: ", style={"fontWeight": "bold"}),
-                        html.Span(id="status-text", children="Waiting for stream..."),
+                        html.Span(
+                            id="status-text", children="Waiting for stream..."
+                        ),
                     ],
                 ),
                 html.Span(
@@ -249,6 +293,7 @@ app.layout = html.Div(
 )
 
 # ----------------- CALLBACKS (NOW LIVE) ----------------- #
+
 
 @app.callback(
     Output("metrics-grid", "children"),
@@ -283,7 +328,9 @@ def update_hr_graph(n, subject_code, window_value):
 
     fig = go.Figure()
     if len(t_sec) > 0 and len(hr_bpm) > 0:
-        fig.add_trace(go.Scatter(x=t_sec, y=hr_bpm, mode="lines", name="Heart Rate"))
+        fig.add_trace(
+            go.Scatter(x=t_sec, y=hr_bpm, mode="lines", name="Heart Rate")
+        )
 
     fig.update_layout(
         title="Heart rate over time",
@@ -313,9 +360,17 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
 
     if freq.size == 0 or psd.size == 0:
         empty_fig = go.Figure()
-        empty_fig.update_layout(template="plotly_dark", margin=dict(l=40, r=20, t=40, b=40), height=230)
+        empty_fig.update_layout(
+            template="plotly_dark",
+            margin=dict(l=40, r=20, t=40, b=40),
+            height=230,
+        )
 
-        pie_fig = go.Figure(data=[go.Pie(labels=["VLF", "LF", "HF"], values=[0, 0, 0], hole=0.3)])
+        pie_fig = go.Figure(
+            data=[
+                go.Pie(labels=["VLF", "LF", "HF"], values=[0, 0, 0], hole=0.3)
+            ]
+        )
         pie_fig.update_layout(
             title="VLF / LF / HF power distribution (Welch)",
             template="plotly_dark",
@@ -327,9 +382,16 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
     max_psd = float(psd.max())
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=freq, y=psd, mode="lines", name="PSD (Welch)"))
+    fig.add_trace(
+        go.Scatter(x=freq, y=psd, mode="lines", name="PSD (Welch)")
+    )
 
-    bands = {"VLF": (0.0033, 0.04), "LF": (0.04, 0.15), "HF": (0.15, 0.40)}
+    # Band sınırlarını konfigürasyondan al
+    bands = {
+        "VLF": VLF_BAND,
+        "LF": LF_BAND,
+        "HF": HF_BAND,
+    }
     colors = {
         "VLF": "rgba(56, 161, 105, 0.25)",
         "LF": "rgba(66, 153, 225, 0.25)",
@@ -366,9 +428,15 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
     )
 
     labels = ["VLF", "LF", "HF"]
-    values = [band_powers.get("VLF", 0.0), band_powers.get("LF", 0.0), band_powers.get("HF", 0.0)]
+    values = [
+        band_powers.get("VLF", 0.0),
+        band_powers.get("LF", 0.0),
+        band_powers.get("HF", 0.0),
+    ]
 
-    pie_fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=0.3)])
+    pie_fig = go.Figure(
+        data=[go.Pie(labels=labels, values=values, hole=0.3)]
+    )
     pie_fig.update_layout(
         title="VLF / LF / HF power distribution (Welch)",
         template="plotly_dark",
@@ -456,7 +524,10 @@ def update_subject_info(n, subject_code):
     group_str = "" if group in (None, "") else f" · Group: {group}"
 
     return [
-        html.Span(f"Subject {info.get('code', subject_code)}", style={"fontWeight": "bold"}),
+        html.Span(
+            f"Subject {info.get('code', subject_code)}",
+            style={"fontWeight": "bold"},
+        ),
         html.Br(),
         html.Span(f"Age: {age_str} · Sex: {sex_str}{group_str}"),
     ]
@@ -472,7 +543,6 @@ def update_subject_info(n, subject_code):
 def update_status_bar(n, subject_code, window_value):
     window_s = _window_to_seconds(window_value)
     status = get_signal_status(subject_code, window_length_s=window_s)
-
 
     quality_label = status.get("quality_label", "Unknown")
     status_text = status.get("status_text", "No status available")

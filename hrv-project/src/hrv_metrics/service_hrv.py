@@ -1,64 +1,113 @@
 # src/hrv_metrics/service_hrv.py
+"""
+HRV service layer.
+
+Sorumluluklar:
+    - Canlı RR verisini GLOBAL_RR_BUFFER üzerinden okumak.
+    - Gerekirse (LIVE_ONLY kapalıysa) CSV fallback ile offline RR verisini yüklemek.
+    - Time-domain, frequency-domain ve Poincaré temelli HRV metriklerini hesaplamak.
+    - Subject listesi ve demografik bilgileri sağlamak.
+    - Sinyal kalitesi (teknik) özeti üretmek.
+
+Konfigürasyon:
+    - Veri yolları:    settings.paths
+    - HRV parametreleri (fs_resample, bant sınırları): settings.hrv
+    - Dashboard ile ilgili limitler (ör. max_points):  settings.dashboard
+"""
+
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
 from scipy.signal import welch
 
+from src.config.settings import settings
 from src.streaming.rr_buffer import GLOBAL_RR_BUFFER
-LIVE_ONLY = True  # dashboard demo modunda CSV fallback kapalı
 
 
+# Canlı mod (True) iken, RR kaynağı sadece GLOBAL_RR_BUFFER'dır.
+# False yapılırsa, RR verisi yoksa CSV fallback devreye girer (offline analiz).
+LIVE_ONLY: bool = True
 
-# Proje kökü: .../hrv-project
-ROOT_DIR = Path(__file__).parents[2]
-PATIENT_INFO_PATH = ROOT_DIR / "Datas" / "processed" / "patient-info.csv"
+# Konfigürasyondan gelen yollar
+PATIENT_INFO_PATH: Path = settings.paths.patient_info_path
+RR_DIR: Path = settings.paths.rr_processed_dir
 
-# RR dosyalarının olduğu klasör:
-# hrv-project/data/processed/rr_clean
-RR_DIR = ROOT_DIR / "data" / "processed" / "rr_clean"
 
-def get_available_subject_codes():
+def get_available_subject_codes() -> List[str]:
     """
     rr_clean klasöründeki *_clean.csv dosyalarından subject_code listesini üretir.
     Örn: 000_clean.csv -> '000'
+
+    Dönüş:
+        Sayısal sıraya göre sıralanmış subject code listesi (str).
     """
-    codes = []
+    codes: List[str] = []
     for path in RR_DIR.glob("*_clean.csv"):
         code = path.stem.replace("_clean", "")
         codes.append(code)
 
-    # sayısal sıraya göre sırala (000,002,003,005,401,...)
-    def _sort_key(c):
+    # sayısal sıraya göre sırala (000, 002, 003, 005, 401, ...)
+    def _sort_key(c: str) -> int:
         try:
             return int(c)
         except ValueError:
-            return 999999  # numara olmayanları sona at
+            return 999_999  # numara olmayanları sona at
 
     codes = sorted(codes, key=_sort_key)
     return codes
 
 
 # -------------------- RR KAYNAĞI -------------------- #
-def load_rr(subject_code: str, window_length_s: float | None = None) -> np.ndarray:
+
+def load_rr(subject_code: str, window_length_s: Optional[float] = None) -> np.ndarray:
+    """
+    Verilen subject için RR serisini saniye cinsinden döner.
+
+    Öncelik:
+        1) GLOBAL_RR_BUFFER içindeki canlı veri
+        2) (LIVE_ONLY False ise) CSV fallback:
+           data/processed/rr_clean/{subject_code}_clean.csv
+
+    Args:
+        subject_code:
+            Örn. "000", "002", "401".
+        window_length_s:
+            Eğer None ise:
+                Tam buffer veya tam kayıt kullanılır.
+            Eğer > 0 ise:
+                Sadece son window_length_s saniyeye düşen RR intervalleri alınır.
+
+    Returns:
+        1D numpy array (float64), saniye cinsinden RR intervalleri.
+    """
     rr_live = GLOBAL_RR_BUFFER.get_rr_sec(subject_code, window_s=window_length_s)
     if rr_live and len(rr_live) >= 2:
         return np.asarray(rr_live, dtype=float)
 
     if LIVE_ONLY:
-        return np.asarray([], dtype=float)   # CSV'ye düşme!
+        # Dashboard demo modunda CSV'ye düşme
+        return np.asarray([], dtype=float)
 
     rr = load_rr_from_csv(subject_code)
     return _apply_time_window(rr, window_length_s)
 
 
-
-
 def load_rr_from_csv(subject_code: str) -> np.ndarray:
     """
     Belirli bir denek için RR serisini CSV'den okur.
-    subject_code: '000', '002', '401' gibi.
-    Beklenen dosya adı: 000_clean.csv, 002_clean.csv, 401_clean.csv ...
+
+    subject_code:
+        "000", "002", "401" vb.
+
+    Beklenen dosya adı:
+        {subject_code}_clean.csv
+
+    Beklenen kolonlar:
+        - 'rr'    : saniye (direct use)
+        - 'rr_ms' : milisaniye, saniyeye çevrilir (rr_ms / 1000)
     """
     csv_path = RR_DIR / f"{subject_code}_clean.csv"
 
@@ -67,10 +116,6 @@ def load_rr_from_csv(subject_code: str) -> np.ndarray:
 
     df = pd.read_csv(csv_path)
 
-    # BURADA BİR VARSAYIM YAPIYORUM:
-    #   - Eğer kolon adı 'rr' ise direkt alıyoruz
-    #   - Eğer 'rr_ms' ise saniyeye çeviriyoruz (ms / 1000)
-    # Eğer sende farklı isimse (örneğin 'RR_interval_ms') sadece aşağıdaki kısmı değiştirmen yeter.
     if "rr" in df.columns:
         rr_sec = df["rr"].to_numpy(dtype=float)
     elif "rr_ms" in df.columns:
@@ -87,18 +132,20 @@ def load_rr_from_csv(subject_code: str) -> np.ndarray:
 
 # -------------------- TIME-DOMAIN HESAP -------------------- #
 
-def _compute_time_domain_from_rr(rr: np.ndarray) -> dict:
+def _compute_time_domain_from_rr(rr: np.ndarray) -> Dict[str, float]:
     """
     Tek boyutlu RR serisinden temel ve ilerletilmiş time-domain HRV metriklerini hesaplar.
 
-    rr: saniye cinsinden RR intervalleri (ör: 0.8 = 800 ms)
+    Girdi:
+        rr:
+            Saniye cinsinden RR intervalleri (ör: 0.8 = 800 ms)
 
     Dönen değerler (ms veya bpm):
-      - sdnn, sdrr, rmssd
-      - nn50, pnn50
-      - mean_hr, hr_max, hr_min, hr_range
-      - hti, tinn (histogram tabanlı metrikler)
-      - n_beats, duration_s
+        - sdnn, sdrr, rmssd
+        - nn50, pnn50
+        - mean_hr, hr_max, hr_min, hr_range
+        - hti, tinn (histogram tabanlı metrikler)
+        - n_beats, duration_s
     """
     rr = np.asarray(rr, dtype=float)
 
@@ -108,7 +155,7 @@ def _compute_time_domain_from_rr(rr: np.ndarray) -> dict:
             "sdnn": float("nan"),
             "sdrr": float("nan"),
             "rmssd": float("nan"),
-            "nn50": 0,
+            "nn50": 0.0,
             "pnn50": float("nan"),
             "mean_hr": float("nan"),
             "hr_max": float("nan"),
@@ -116,7 +163,7 @@ def _compute_time_domain_from_rr(rr: np.ndarray) -> dict:
             "hr_range": float("nan"),
             "hti": float("nan"),
             "tinn": float("nan"),
-            "n_beats": int(rr.size),
+            "n_beats": float(rr.size),
             "duration_s": float(np.sum(rr)) if rr.size > 0 else 0.0,
         }
 
@@ -139,7 +186,7 @@ def _compute_time_domain_from_rr(rr: np.ndarray) -> dict:
         rmssd = float("nan")
 
     # NN50 & pNN50 (%)
-    nn50 = int(np.sum(np.abs(diff_ms) > 50.0))
+    nn50 = float(np.sum(np.abs(diff_ms) > 50.0))
     pnn50 = float(nn50 / diff_ms.size * 100.0) if diff_ms.size > 0 else float("nan")
 
     # Mean RR, HR min/max (bpm)
@@ -156,7 +203,7 @@ def _compute_time_domain_from_rr(rr: np.ndarray) -> dict:
         else float("nan")
     )
 
-    # Histogram tabanlı HTI ve TINN (eski defterdeki mantık)
+    # Histogram tabanlı HTI ve TINN
     try:
         counts, bins = np.histogram(rr_ms, bins="auto")
         if counts.size == 0 or counts.max() == 0:
@@ -197,17 +244,19 @@ def _compute_time_domain_from_rr(rr: np.ndarray) -> dict:
         "hr_range": hr_range,
         "hti": hti,
         "tinn": tinn,
-        "n_beats": n_beats,
+        "n_beats": float(n_beats),
         "duration_s": duration_s,
     }
 
 
-def _apply_time_window(rr: np.ndarray, window_length_s: float | None) -> np.ndarray:
+def _apply_time_window(rr: np.ndarray, window_length_s: Optional[float]) -> np.ndarray:
     """
     RR serisini (saniye cinsinden) verilen pencere süresine göre kırpar.
-    - window_length_s None ise: tüm kayıt kullanılır.
-    - window_length_s > 0 ise: sadece SON window_length_s saniyeyi kapsayan
-      RR intervalleri döner.
+
+    - window_length_s None ise:
+        Tüm kayıt kullanılır.
+    - window_length_s > 0 ise:
+        Sadece SON window_length_s saniyeyi kapsayan RR intervalleri döner.
 
     Örnek:
         total_duration = 1200 s ve window_length_s = 300 s ise,
@@ -222,7 +271,7 @@ def _apply_time_window(rr: np.ndarray, window_length_s: float | None) -> np.ndar
     t_cum = np.cumsum(rr)  # kümülatif zaman (s)
     total_duration = float(t_cum[-1])
 
-    # Kayıt zaten 5 dakikadan kısaysa -> dokunma
+    # Kayıt zaten window_length_s'ten kısaysa -> dokunma
     if total_duration <= window_length_s:
         return rr
 
@@ -231,16 +280,15 @@ def _apply_time_window(rr: np.ndarray, window_length_s: float | None) -> np.ndar
     return rr[mask]
 
 
-
-# -------------------- FREQUENCY-DOMAIN HESAP -------------------- #
-
-# Computes VLF / LF / HF band powers from RR series (seconds)
 # -------------------- FREQUENCY-DOMAIN HESAP -------------------- #
 
 def _compute_freq_domain_from_rr(
     rr: np.ndarray,
-    fs_resample: float = 4.0,
-) -> dict:
+    fs_resample: float,
+    vlf_band: Tuple[float, float],
+    lf_band: Tuple[float, float],
+    hf_band: Tuple[float, float],
+) -> Dict[str, object]:
     """
     RR (saniye) serisinden frekans-domeni HRV metriklerini hesaplar.
 
@@ -308,9 +356,9 @@ def _compute_freq_domain_from_rr(
             return 0.0
         return float(np.trapz(psd[mask], freq[mask]))
 
-    vlf = _band_power(0.0033, 0.04)
-    lf = _band_power(0.04, 0.15)
-    hf = _band_power(0.15, 0.40)
+    vlf = _band_power(*vlf_band)
+    lf = _band_power(*lf_band)
+    hf = _band_power(*hf_band)
 
     lf_hf_ratio = float(lf / hf) if hf > 0 else float("nan")
 
@@ -324,32 +372,61 @@ def _compute_freq_domain_from_rr(
 
 def get_freq_domain_metrics(
     subject_code: str,
-    window_length_s: float | None = None,
-    fs_resample: float = 4.0,
-) -> dict:
+    window_length_s: Optional[float] = None,
+    fs_resample: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Verilen subject için frekans-domeni HRV metriklerini döner.
+
+    Parametreler:
+        window_length_s:
+            None -> tüm buffer/kayıt
+            >0  -> son window_length_s saniye
+        fs_resample:
+            Yeniden örnekleme frekansı (Hz). None ise settings.hrv.fs_resample kullanılır.
+    """
+    if fs_resample is None:
+        fs_resample = settings.hrv.fs_resample
+
+    vlf_band = settings.hrv.vlf_band
+    lf_band = settings.hrv.lf_band
+    hf_band = settings.hrv.hf_band
+
     rr = load_rr(subject_code, window_length_s=window_length_s)
-    fd = _compute_freq_domain_from_rr(rr, fs_resample=fs_resample)
+    fd = _compute_freq_domain_from_rr(
+        rr,
+        fs_resample=fs_resample,
+        vlf_band=vlf_band,
+        lf_band=lf_band,
+        hf_band=hf_band,
+    )
     fd["window_length_s"] = window_length_s
     return fd
 
 
-
-
-
-
-
-
-
+# -------------------- HR TIME-SERIES -------------------- #
 
 def get_hr_timeseries(
     subject_code: str,
-    max_points: int = 500,
-    window_length_s: float | None = None,
-):
+    max_points: Optional[int] = None,
+    window_length_s: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Verilen subject için HR zaman serisini döner.
+
+    Dönüş:
+        t_sec  : kümülatif zaman (saniye)
+        hr_bpm : kalp hızı (bpm)
+
+    max_points None ise, settings.dashboard.max_hr_points kullanılır.
+    """
     rr = load_rr(subject_code, window_length_s=window_length_s)
 
     if rr.size < 1:
-        return [], []
+        return np.asarray([]), np.asarray([])
+
+    if max_points is None:
+        max_points = settings.dashboard.max_hr_points
 
     t_sec = np.cumsum(rr)
     hr_bpm = 60.0 / rr
@@ -361,11 +438,13 @@ def get_hr_timeseries(
     return t_sec, hr_bpm
 
 
-
 def get_time_domain_metrics(
     subject_code: str = "000",
-    window_length_s: float | None = None,
-) -> dict:
+    window_length_s: Optional[float] = None,
+) -> Dict[str, float]:
+    """
+    Time-domain HRV metriklerini döner (sdnn, rmssd, pnn50, hr_min, hr_max, ...).
+    """
     rr = load_rr(subject_code, window_length_s=window_length_s)
     td = _compute_time_domain_from_rr(rr)
     td["window_length_s"] = window_length_s
@@ -374,9 +453,22 @@ def get_time_domain_metrics(
 
 def get_poincare_data(
     subject_code: str,
-    max_points: int = 1000,
-    window_length_s: float | None = None,
-) -> dict:
+    max_points: Optional[int] = None,
+    window_length_s: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Poincaré plot verisini ve non-linear metrikleri döner.
+
+    Dönüş:
+        x, y:
+            RRₙ ve RRₙ₊₁ (ms cinsinden), scatter plot için
+        sd1, sd2:
+            Kısa ve uzun eksen standart sapmaları
+        sd1_sd2_ratio:
+            SD1 / SD2 oranı
+        stress_index:
+            SD2 / SD1 oranına dayalı basit bir stres indeksi
+    """
     rr = load_rr(subject_code, window_length_s=window_length_s)
 
     if rr.size < 3:
@@ -388,6 +480,9 @@ def get_poincare_data(
             "sd1_sd2_ratio": float("nan"),
             "stress_index": float("nan"),
         }
+
+    if max_points is None:
+        max_points = settings.dashboard.max_poincare_points
 
     rr_ms = rr * 1000.0
     x = rr_ms[:-1]
@@ -418,7 +513,7 @@ def get_poincare_data(
     }
 
 
-def get_subject_info(subject_code: str) -> dict:
+def get_subject_info(subject_code: str) -> Dict[str, object]:
     """
     Demografik bilgiler: age / sex / group (child/adult/older).
 
@@ -427,8 +522,6 @@ def get_subject_info(subject_code: str) -> dict:
     - Ya da hiç header olmayıp direkt "0;53;M" ile başlayabilir.
     - İlk kolon bazen "File" bazen "code" olabilir.
     """
-
-    # 1) CSV'yi oku (header varmış/yokmuş gibi düşünmeden)
     try:
         df = pd.read_csv(
             PATIENT_INFO_PATH,
@@ -439,7 +532,6 @@ def get_subject_info(subject_code: str) -> dict:
     except FileNotFoundError:
         return {"code": subject_code, "age": None, "sex": None, "group": None}
 
-    # 2) Eğer ilk satır aslında header ise (code/File yazıyorsa) onu at
     df["code"] = df["code"].astype(str)
     mask_header = df["code"].str.lower().isin(["code", "file"])
     df = df[~mask_header]
@@ -447,10 +539,8 @@ def get_subject_info(subject_code: str) -> dict:
     if df.empty:
         return {"code": subject_code, "age": None, "sex": None, "group": None}
 
-    # 3) code kolonunu sayıya çevir (0, 2, 401 vs.)
     df["code"] = pd.to_numeric(df["code"], errors="coerce")
 
-    # subject_code -> int (örn. "000" -> 0)
     try:
         code_int = int(subject_code)
     except ValueError:
@@ -459,7 +549,6 @@ def get_subject_info(subject_code: str) -> dict:
     if code_int is not None:
         row = df[df["code"] == code_int]
     else:
-        # Sayıya çevrilemiyorsa fallback string karşılaştırma
         row = df[df["code"].astype(str) == str(subject_code)]
 
     if row.empty:
@@ -468,7 +557,6 @@ def get_subject_info(subject_code: str) -> dict:
     age = row.iloc[0]["age"]
     sex = row.iloc[0]["sex"]
 
-    # 4) Yaşa göre grup (sadece gerçekten sayıysa)
     try:
         age_val = float(age)
     except (TypeError, ValueError):
@@ -486,11 +574,12 @@ def get_subject_info(subject_code: str) -> dict:
     return {"code": subject_code, "age": age, "sex": sex, "group": group}
 
 
-
-def _compute_signal_quality(rr: np.ndarray) -> dict:
+def _compute_signal_quality(rr: np.ndarray) -> Dict[str, object]:
     """
     RR serisinden basit bir sinyal kalite özeti üretir.
-    Bu sadece teknik bir kalite değerlendirmesidir, klinik/medikal yorum değildir.
+
+    Not:
+        Bu sadece teknik bir kalite değerlendirmesidir, klinik/medikal yorum değildir.
     """
     rr = np.asarray(rr, dtype=float)
     n_total = rr.size
@@ -544,7 +633,9 @@ def _compute_signal_quality(rr: np.ndarray) -> dict:
     }
 
 
-def get_signal_status(subject_code: str, window_length_s: float | None = None) -> dict:
+def get_signal_status(subject_code: str, window_length_s: Optional[float] = None) -> Dict[str, object]:
+    """
+    Belirli bir subject ve pencere için sinyal kalitesi özetini döner.
+    """
     rr = load_rr(subject_code, window_length_s=window_length_s)
     return _compute_signal_quality(rr)
-

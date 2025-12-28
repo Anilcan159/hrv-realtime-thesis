@@ -4,31 +4,27 @@
 #   - Fizyolojik filtre + güvenli interpolasyon + zaman / HR hesapları
 
 from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
+from src.config.settings import settings
 
-# Root paths
-# __file__ = .../hrv-project/src/streaming/preprocessing.py
-BASE_DIR = Path(__file__).resolve().parents[2]  # -> .../hrv-project
-RAW_DATA_DIR = (
-    BASE_DIR
-    / "Datas"
-    / "raw"
-    / "physionet.org"
-    / "files"
-    / "rr-interval-healthy-subjects"
-    / "1.0.0"
-)
-PROCESSED_DIR = BASE_DIR / "data" / "processed" / "rr_clean"
+
+# Root paths (config-driven)
+RAW_DATA_DIR: Path = settings.paths.raw_data_dir
+PROCESSED_DIR: Path = settings.paths.rr_processed_dir
 
 
 def load_rr_series(subject_id: str) -> pd.DataFrame:
     """
     Raw RR serisini (ms) tek sütunlu DataFrame olarak yükler.
-    Örn: RAW_DATA_DIR / '000.txt' -> rr_ms kolonu.
 
-    Her satır bir RR interval (ms).
+    Örnek:
+        RAW_DATA_DIR / '000.txt'  ->  rr_ms kolonu
+
+    Her satır bir RR interval (ms) temsil eder.
     """
     file_path = RAW_DATA_DIR / f"{subject_id}.txt"
     df = pd.read_csv(file_path, header=None, names=["rr_ms"])
@@ -39,19 +35,30 @@ def load_rr_series(subject_id: str) -> pd.DataFrame:
 
 def _mark_outliers_physio(
     rr_ms: pd.Series,
-    rr_min: int = 300,
-    rr_max: int = 2000,
+    rr_min: Optional[int] = None,
+    rr_max: Optional[int] = None,
 ) -> pd.Series:
     """
     Fizyolojik sınırlar dışındaki RR değerlerini NaN yapar.
 
-    - rr_min, rr_max ms cinsindendir.
-    - 300–2000 ms bandı Task Force ve pratik HRV çalışmalarında yaygın kullanılan
-      bir kaba aralıktır (çok hızlı / çok yavaş veya artefakt atımlar elenir).
+    Parametreler:
+        rr_min:
+            Alt sınır (ms). None ise settings.hrv.rr_min_ms kullanılır.
+        rr_max:
+            Üst sınır (ms). None ise settings.hrv.rr_max_ms kullanılır.
+
+    Not:
+        300–2000 ms bandı, kısa süreli HRV çalışmalarında sık kullanılan
+        bir kaba fizyolojik aralıktır (yaklaşık 30–200 bpm).
     """
+    if rr_min is None:
+        rr_min = settings.hrv.rr_min_ms
+    if rr_max is None:
+        rr_max = settings.hrv.rr_max_ms
+
     rr = pd.to_numeric(rr_ms, errors="coerce").astype(float)
 
-    # Fiziksel aralık dışında kalanları NaN yap
+    # Fizyolojik aralık dışında kalanları NaN yap
     mask_out = (rr < rr_min) | (rr > rr_max)
     rr[mask_out] = np.nan
 
@@ -62,7 +69,7 @@ def _mark_outliers_physio(
 
 def _interpolate_short_gaps(
     rr_ms: np.ndarray,
-    max_gap_beats: int = 3,
+    max_gap_beats: int = settings.hrv.max_gap_beats,
 ) -> np.ndarray:
     """
     RR (ms) dizisinde NaN olan KISA boşlukları güvenli şekilde doldurur.
@@ -75,8 +82,8 @@ def _interpolate_short_gaps(
           * Olduğu gibi NaN bırakılır (güvenilmez segmentler).
       - En sonda kalan NaN'lar (uzun bloklar) tamamen DROPlanır.
 
-    Bu, eski defterde kullandığın "kısa boşlukları düzelt, uzunları kullanma"
-    fikrinin sade ve deterministik bir implementasyonudur.
+    Bu, "kısa boşlukları düzelt, uzun segmentleri dışla" fikrinin
+    sade ve deterministik bir implementasyonudur.
     """
     rr = np.asarray(rr_ms, dtype=float).copy()
     n = rr.size
@@ -135,25 +142,30 @@ def _interpolate_short_gaps(
 
 def clean_rr_values(
     df: pd.DataFrame,
-    rr_min: int = 300,
-    rr_max: int = 2000,
-    max_gap_beats: int = 3,
+    rr_min: Optional[int] = None,
+    rr_max: Optional[int] = None,
+    max_gap_beats: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Raw RR DataFrame'ini temizler:
 
     1) 'rr_ms' kolonunu sayısal tipe çevirir.
-    2) 300–2000 ms fizyolojik aralığı dışını NaN yapar.
+    2) Fizyolojik aralık (rr_min–rr_max, ms) dışını NaN yapar.
     3) Kısa NaN bloklarını (<= max_gap_beats) interpolasyonla düzeltir.
     4) Uzun blokları tamamen atar.
     5) Temiz RR serisini 'rr_ms' kolonu olarak döner.
 
-    Bu adımlar, eski Colab defterindeki:
-      - fizyolojik filtre
-      - güvenli interpolasyon (kısa boşluk)
-      - problemli segmentleri dışlama
-    mantığıyla uyumludur.
+    Varsayılan parametreler, settings.hrv içinde tanımlıdır:
+        - rr_min_ms, rr_max_ms
+        - max_gap_beats
     """
+    if rr_min is None:
+        rr_min = settings.hrv.rr_min_ms
+    if rr_max is None:
+        rr_max = settings.hrv.rr_max_ms
+    if max_gap_beats is None:
+        max_gap_beats = settings.hrv.max_gap_beats
+
     df = df.copy()
 
     # 1) Fizyolojik outlier'ları NaN yap
@@ -197,14 +209,23 @@ def add_time_and_hr(df: pd.DataFrame, subject_id: str) -> pd.DataFrame:
 
 def process_single_subject(
     subject_id: str,
-    rr_min: int = 300,
-    rr_max: int = 2000,
-    max_gap_beats: int = 3,
+    rr_min: Optional[int] = None,
+    rr_max: Optional[int] = None,
+    max_gap_beats: Optional[int] = None,
 ) -> None:
     """
     Tek bir subject için tam pipeline:
       raw txt -> temizlenmiş rr_ms + time_s + hr_bpm -> CSV.
+
+    Varsayılan temizleme parametreleri, settings.hrv üzerinden gelir.
     """
+    if rr_min is None:
+        rr_min = settings.hrv.rr_min_ms
+    if rr_max is None:
+        rr_max = settings.hrv.rr_max_ms
+    if max_gap_beats is None:
+        max_gap_beats = settings.hrv.max_gap_beats
+
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     df_raw = load_rr_series(subject_id)
@@ -218,7 +239,7 @@ def process_single_subject(
 
     out_path = PROCESSED_DIR / f"{subject_id}_clean.csv"
     df_final.to_csv(out_path, index=False)
-    print(f"Saved: {out_path}")
+    print(f"[preprocessing] Saved: {out_path}")
 
 
 # -------------------- TÜM SUBJECT'LERİ İŞLE -------------------- #
@@ -229,21 +250,21 @@ def process_all_subjects() -> None:
     sayısal ID'lere sahip olanları işler.
 
     Not:
-      - LICENSE vs. gibi dosyalar atlanır.
+      - LICENSE vb. metadata dosyaları atlanır.
     """
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     txt_files = sorted(RAW_DATA_DIR.glob("*.txt"))
-    print(f"Found {len(txt_files)} raw txt files.")
+    print(f"[preprocessing] Found {len(txt_files)} raw txt files in {RAW_DATA_DIR}")
 
     for f in txt_files:
         subject_id = f.stem  # "000", "401", "LICENSE", ...
 
         if not subject_id.isdigit():
-            print(f"Skipping non-subject file: {f.name}")
+            print(f"[preprocessing] Skipping non-subject file: {f.name}")
             continue
 
-        print(f"Processing subject {subject_id} ...")
+        print(f"[preprocessing] Processing subject {subject_id} ...")
         process_single_subject(subject_id)
 
 
