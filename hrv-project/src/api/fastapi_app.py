@@ -333,6 +333,53 @@ def hr_series_metrics(
         "n_points": len(t_list),
     }
 
+# --- HR time-series endpoint --- #
+
+from typing import Any  # en üstte varsa tekrar ekleme
+
+# --- HR time-series endpoint --- #
+
+@app.get("/metrics/hr_timeseries")
+def hr_timeseries(
+    subject: str = Query(..., description="Subject code, e.g. '000'"),
+    window: Optional[str] = Query(
+        None,
+        description="Named window: 'full' or 'last_5min'. If provided, overrides window_s.",
+    ),
+    window_s: Optional[float] = Query(
+        None,
+        description="Window length in seconds. If not provided, uses named window or full recording.",
+    ),
+    max_points: Optional[int] = Query(
+        None,
+        description="Maximum number of HR points to return.",
+    ),
+) -> Dict[str, Any]:
+    window_length_s = _resolve_window_s(window, window_s)
+    mp = max_points if max_points is not None else settings.dashboard.max_hr_points
+
+    logger.info(
+        "GET /metrics/hr_timeseries subject=%s window=%s window_s=%s max_points=%s -> window_length_s=%.3f",
+        subject,
+        window,
+        window_s,
+        mp,
+        float(window_length_s) if window_length_s is not None else -1.0,
+    )
+
+    t_sec, hr_bpm = get_hr_timeseries(
+        subject_code=subject,
+        max_points=mp,
+        window_length_s=window_length_s,
+    )
+
+    return {
+        "t_sec": t_sec.tolist(),
+        "hr_bpm": hr_bpm.tolist(),
+        "window_length_s": window_length_s,
+    }
+
+
 
 # --- Local run entrypoint (uvicorn) --- #
 
@@ -350,3 +397,4 @@ if __name__ == "__main__":
         port=8000,
         reload=True,
     )
+

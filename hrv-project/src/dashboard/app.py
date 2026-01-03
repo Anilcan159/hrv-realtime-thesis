@@ -1,121 +1,116 @@
 # src/dashboard/app.py
-"""
-Dash-based HRV live dashboard.
-
-Bu dashboard artik tamamen FastAPI'yi REST client olarak kullaniyor:
-    - Subject listesi   -> GET /subjects
-    - Subject bilgisi   -> GET /subjects/{subject_code}
-    - Time-domain       -> GET /metrics/time
-    - Freq-domain       -> GET /metrics/freq
-    - Poincare          -> GET /metrics/poincare
-    - Signal status     -> GET /metrics/status
-    - HR time-series    -> GET /metrics/hr_series
-
-Lokal service_hrv fonksiyonlarina veya rr_consumer'a dogrudan bagimlilik KALMADI.
-"""
-
 import os
 import sys
-from typing import Dict, Any
+from typing import Any, Dict
 
 import numpy as np
+import requests
 from dash import Dash, html, dcc, Input, Output
 import plotly.graph_objects as go
-import requests
 
-# --- PROJE KÖKÜNÜ sys.path'E EKLE --- #
-CURRENT_DIR = os.path.dirname(__file__)                  # .../src/dashboard
+# ----------------- PROJE KÖKÜ ----------------- #
+
+CURRENT_DIR = os.path.dirname(__file__)                    # .../src/dashboard
 PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))  # .../hrv-project
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from src.config.settings import settings
+from src.hrv_metrics.service_hrv import (
+    get_time_domain_metrics,
+    get_available_subject_codes,
+    get_hr_timeseries,
+    get_poincare_data,
+    get_subject_info,
+    get_freq_domain_metrics,
+    get_signal_status,
+)
+from src.streaming.rr_consumer import start_consumer_background
 
 
-app = Dash(__name__)
+# ----------------- RENK PALETİ (PASTEL) ----------------- #
 
-# Panel stili
+PALETTE: Dict[str, str] = {
+    "bg": "#F5F7FB",
+    "bg_soft": "#EDF2FF",
+    "card": "#FFFFFF",
+    "card_alt": "#FDFEFF",
+    "border": "#E2E8F0",
+    "primary": "#4C6FFF",
+    "primary_soft": "#E3E8FF",
+    "accent": "#FF8BA7",
+    "accent_soft": "#FFE5EC",
+    "text": "#1F2933",
+    "muted": "#718096",
+    "muted_soft": "#A0AEC0",
+    "good": "#38A169",
+    "warning": "#F6AD55",
+}
+
 PANEL_STYLE = {
-    "backgroundColor": "#131F39",
-    "border": "1px solid #223459",
-    "borderRadius": "12px",
-    "padding": "15px",
+    "backgroundColor": PALETTE["card"],
+    "border": f"1px solid {PALETTE['border']}",
+    "borderRadius": "18px",
+    "padding": "18px",
     "display": "flex",
     "flexDirection": "column",
     "gap": "12px",
+    "boxShadow": "0 10px 30px rgba(15, 23, 42, 0.06)",
+}
+
+METRIC_CARD_STYLE = {
+    "backgroundColor": PALETTE["card_alt"],
+    "borderRadius": "14px",
+    "padding": "14px 16px",
+    "display": "flex",
+    "flexDirection": "column",
+    "gap": "6px",
+    "minHeight": "90px",
+    "border": f"1px solid {PALETTE['border']}",
+    "alignItems": "center",       # ortala
+    "justifyContent": "center",   # dikeyde ortala
+    "textAlign": "center",        # metni ortala
 }
 
 
-def _fetch_from_api(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+
+# ----------------- YARDIMCI FONKSİYONLAR ----------------- #
+
+def _fetch_from_api(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
     FastAPI HRV servisinden JSON veri çeker.
-    Hata olursa bos dict dondurur.
+    Her türlü hata durumunda boş dict döner (dashboard çökmesin).
     """
-    if params is None:
-        params = {}
     base_url = settings.api.base_url.rstrip("/")
     url = f"{base_url}{path}"
+
     try:
         resp = requests.get(url, params=params, timeout=1.0)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        # Basit debug icin console'a yaz. Ileride logging'e tasinabilir.
         print(f"[dashboard] API request failed: {e} (url={url}, params={params})")
         return {}
 
 
-# Config-driven defaults (dashboard-level)
-DEFAULT_WINDOW_S = settings.dashboard.default_window_s  # e.g. 5 * 60
+DEFAULT_WINDOW_S = settings.dashboard.default_window_s
 VLF_BAND = settings.hrv.vlf_band
 LF_BAND = settings.hrv.lf_band
 HF_BAND = settings.hrv.hf_band
 
 
-def metric_card(title: str, value: str, unit: str = "") -> html.Div:
-    return html.Div(
-        style={
-            "backgroundColor": "#223459",
-            "borderRadius": "10px",
-            "padding": "10px 12px",
-            "display": "flex",
-            "flexDirection": "column",
-            "gap": "4px",
-            "minHeight": "70px",
-        },
-        children=[
-            html.Span(
-                title,
-                style={
-                    "fontSize": "12px",
-                    "color": "#A0AEC0",
-                    "letterSpacing": "0.05em",
-                },
-            ),
-            html.Div(
-                style={"display": "flex", "alignItems": "baseline", "gap": "4px"},
-                children=[
-                    html.Span(value, style={"fontSize": "20px", "fontWeight": "bold"}),
-                    html.Span(unit, style={"fontSize": "11px", "color": "#CBD5F5"}),
-                ],
-            ),
-        ],
-    )
-
-
 def _window_to_seconds(window_value: str | None) -> float | None:
     """
-    UI'dan gelen pencere seçimini (full / last_5min) saniye cinsine çevirir.
-
-    "last_5min" değeri, settings.dashboard.default_window_s üzerinden yönetilir.
+    'full' -> None (tüm kayıt),
+    'last_5min' -> DEFAULT_WINDOW_S
     """
     if window_value == "last_5min":
         return float(DEFAULT_WINDOW_S)
-    # "full" veya bilinmeyen değerler -> None (full buffer/recording)
     return None
 
 
-def _fmt(v, nd: int = 1) -> str:
+def _fmt(v: Any, nd: int = 1) -> str:
+    """Metrik sayısını güvenli şekilde string'e çevirir."""
     try:
         if v is None:
             return "N/A"
@@ -126,93 +121,193 @@ def _fmt(v, nd: int = 1) -> str:
         return "N/A"
 
 
-# Subject listesi API'den cekilir (uygulama ayaga kalkarken bir kere deniyoruz)
-_subjects_resp = _fetch_from_api("/subjects")
-_subject_codes = _subjects_resp.get("subjects", [])
+def metric_card(title: str, value: str, unit: str = "") -> html.Div:
+    return html.Div(
+        style=METRIC_CARD_STYLE,
+        children=[
+            html.Span(
+                title,
+                style={
+                    "fontSize": "13px",
+                    "fontWeight": "600",
+                    "color": PALETTE["primary"],     # <-- daha belirgin renk
+                    "letterSpacing": "0.06em",
+                    "textTransform": "uppercase",
+                    "textAlign": "center",
+                },
+            ),
+            html.Div(
+                style={
+                    "display": "flex",
+                    "alignItems": "baseline",
+                    "justifyContent": "center",      # <-- ortala
+                    "gap": "4px",
+                },
+                children=[
+                    html.Span(
+                        value,
+                        style={
+                            "fontSize": "24px",
+                            "fontWeight": "600",
+                            "color": PALETTE["text"],
+                        },
+                    ),
+                    html.Span(
+                        unit,
+                        style={
+                            "fontSize": "11px",
+                            "color": PALETTE["muted_soft"],
+                        },
+                    ),
+                ],
+            ),
+        ],
+    )
 
+
+# ----------------- DASH APP & LAYOUT ----------------- #
+
+app = Dash(__name__)
+subject_codes = get_available_subject_codes()
 
 app.layout = html.Div(
     style={
-        "backgroundColor": "#131F39",
+        "backgroundColor": PALETTE["bg"],
         "minHeight": "100vh",
-        "padding": "20px",
-        "color": "white",
-        "fontFamily": "Arial, sans-serif",
+        "padding": "22px 26px",
+        "color": PALETTE["text"],
+        "fontFamily": "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
     },
     children=[
         dcc.Interval(id="refresh", interval=1000, n_intervals=0),
 
+        # ---------- HEADER ----------
         html.Div(
             style={
                 "display": "flex",
                 "justifyContent": "space-between",
                 "alignItems": "center",
-                "marginBottom": "20px",
+                "marginBottom": "24px",
             },
             children=[
+                # SOL: Başlık + tagline
                 html.Div(
                     children=[
-                        html.H1("HRV Live Dashboard", style={"marginBottom": "5px"}),
+                        html.H1(
+                            "HRV Live Dashboard",
+                            style={
+                                "margin": 0,
+                                "fontSize": "28px",
+                                "fontWeight": "700",
+                                "letterSpacing": "0.02em",
+                            },
+                        ),
                         html.Span(
                             "Real-time heart rate variability monitoring",
-                            style={"fontSize": "13px", "color": "#A0AEC0"},
+                            style={
+                                "fontSize": "13px",
+                                "color": PALETTE["muted"],
+                            },
                         ),
                     ]
                 ),
+
+                # SAĞ: Dropdown'lar + en sağda PNG ikon
                 html.Div(
                     style={
-                        "minWidth": "260px",
                         "display": "flex",
-                        "flexDirection": "column",
-                        "gap": "8px",
+                        "alignItems": "center",
+                        "gap": "24px",
                     },
                     children=[
+                        # Dropdown'lar
                         html.Div(
-                            children=[
-                                html.Label(
-                                    "Subject / Session",
-                                    style={"fontSize": "12px", "marginBottom": "4px"},
-                                ),
-                                dcc.Dropdown(
-                                    id="subject-dropdown",
-                                    options=[
-                                        {"label": f"Subject {code}", "value": code}
-                                        for code in _subject_codes
-                                    ],
-                                    value=_subject_codes[0] if _subject_codes else None,
-                                    clearable=False,
-                                    style={"color": "#000000"},
-                                ),
-                            ]
-                        ),
-                        html.Div(
-                            children=[
-                                html.Label(
-                                    "Analysis window",
-                                    style={"fontSize": "12px", "marginBottom": "4px"},
-                                ),
-                                dcc.Dropdown(
-                                    id="window-dropdown",
-                                    options=[
-                                        {"label": "Full recording", "value": "full"},
-                                        {
-                                            "label": "Last 5 minutes",
-                                            "value": "last_5min",
-                                        },
-                                    ],
-                                    value="last_5min",
-                                    clearable=False,
-                                    style={"color": "#000000"},
-                                ),
-                            ]
-                        ),
-                        html.Div(
-                            id="subject-info",
                             style={
-                                "fontSize": "11px",
-                                "color": "#A0AEC0",
-                                "marginTop": "2px",
-                                "lineHeight": "1.4",
+                                "minWidth": "280px",
+                                "display": "flex",
+                                "flexDirection": "column",
+                                "gap": "8px",
+                            },
+                            children=[
+                                html.Div(
+                                    children=[
+                                        html.Label(
+                                            "Subject / Session",
+                                            style={
+                                                "fontSize": "12px",
+                                                "marginBottom": "4px",
+                                                "color": PALETTE["muted"],
+                                            },
+                                        ),
+                                        dcc.Dropdown(
+                                            id="subject-dropdown",
+                                            options=[
+                                                {
+                                                    "label": f"Subject {code}",
+                                                    "value": code,
+                                                }
+                                                for code in subject_codes
+                                            ],
+                                            value=subject_codes[0]
+                                            if subject_codes
+                                            else None,
+                                            clearable=False,
+                                            style={
+                                                "color": "#111111",
+                                                "backgroundColor": "#FFFFFF",
+                                            },
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    children=[
+                                        html.Label(
+                                            "Analysis window",
+                                            style={
+                                                "fontSize": "12px",
+                                                "marginBottom": "4px",
+                                                "color": PALETTE["muted"],
+                                            },
+                                        ),
+                                        dcc.Dropdown(
+                                            id="window-dropdown",
+                                            options=[
+                                                {
+                                                    "label": "Full recording",
+                                                    "value": "full",
+                                                },
+                                                {
+                                                    "label": "Last 5 minutes",
+                                                    "value": "last_5min",
+                                                },
+                                            ],
+                                            value="last_5min",
+                                            clearable=False,
+                                            style={
+                                                "color": "#111111",
+                                                "backgroundColor": "#FFFFFF",
+                                            },
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    id="subject-info",
+                                    style={
+                                        "fontSize": "11px",
+                                        "color": PALETTE["muted"],
+                                        "marginTop": "2px",
+                                        "lineHeight": "1.4",
+                                    },
+                                ),
+                            ],
+                        ),
+
+                        # En sağ: HRV dalga PNG
+                        html.Img(
+                            src="/assets/hrv_wave.png",   # assets klasöründeki dosya
+                            style={
+                                "height": "40px",
+                                "display": "block",
                             },
                         ),
                     ],
@@ -220,21 +315,46 @@ app.layout = html.Div(
             ],
         ),
 
+
+        # ---------- ANA GRID (3 PANEL) ---------- #
         html.Div(
             style={
                 "display": "grid",
-                "gridTemplateColumns": "1.3fr 1fr 1fr",
+                "gridTemplateColumns": "1.4fr 1fr 1fr",
                 "gridGap": "20px",
-                "marginBottom": "20px",
+                "marginBottom": "18px",
             },
             children=[
+                # TIME-DOMAIN PANEL
                 html.Div(
                     style=PANEL_STYLE,
                     children=[
-                        html.H3("Time-domain metrics", style={"marginBottom": "5px"}),
-                        html.Span(
-                            "Short-term HRV indices computed over recent window",
-                            style={"fontSize": "12px", "color": "#A0AEC0"},
+                        html.Div(
+                            style={
+                                "display": "flex",
+                                "justifyContent": "space-between",
+                                "alignItems": "center",
+                            },
+                            children=[
+                                html.Div(
+                                    children=[
+                                        html.H3(
+                                            "Time-domain metrics",
+                                            style={
+                                                "marginBottom": "2px",
+                                                "fontSize": "16px",
+                                            },
+                                        ),
+                                        html.Span(
+                                            "Short-term HRV indices over recent window",
+                                            style={
+                                                "fontSize": "12px",
+                                                "color": PALETTE["muted"],
+                                            },
+                                        ),
+                                    ]
+                                ),
+                            ],
                         ),
                         html.Div(
                             id="metrics-grid",
@@ -242,29 +362,40 @@ app.layout = html.Div(
                                 "display": "grid",
                                 "gridTemplateColumns": "repeat(3, 1fr)",
                                 "gridGap": "10px",
-                                "marginTop": "5px",
+                                "marginTop": "8px",
                             },
-                            children=[],
                         ),
                         html.Div(
-                            style={"marginTop": "10px"},
+                            style={"marginTop": "12px"},
                             children=[
                                 html.Span(
                                     "Heart rate over time",
-                                    style={"fontSize": "12px", "color": "#A0AEC0"},
+                                    style={
+                                        "fontSize": "12px",
+                                        "color": PALETTE["muted"],
+                                    },
                                 ),
-                                dcc.Graph(id="hr-graph", style={"height": "260px"}),
+                                dcc.Graph(
+                                    id="hr-graph",
+                                    style={"height": "260px"},
+                                    config={"displayModeBar": False},
+                                ),
                             ],
                         ),
                     ],
                 ),
+
+                # FREQUENCY-DOMAIN PANEL
                 html.Div(
                     style=PANEL_STYLE,
                     children=[
-                        html.H3("Frequency-domain metrics", style={"marginBottom": "5px"}),
+                        html.H3(
+                            "Frequency-domain metrics",
+                            style={"marginBottom": "2px", "fontSize": "16px"},
+                        ),
                         html.Span(
                             "Spectral power (Welch) and VLF / LF / HF distribution",
-                            style={"fontSize": "12px", "color": "#A0AEC0"},
+                            style={"fontSize": "12px", "color": PALETTE["muted"]},
                         ),
                         html.Div(
                             style={
@@ -275,21 +406,38 @@ app.layout = html.Div(
                                 "alignItems": "stretch",
                             },
                             children=[
-                                dcc.Graph(id="lf-hf-graph", style={"height": "260px"}),
-                                dcc.Graph(id="band-pie-graph", style={"height": "260px"}),
+                                dcc.Graph(
+                                    id="lf-hf-graph",
+                                    style={"height": "260px"},
+                                    config={"displayModeBar": False},
+                                ),
+                                dcc.Graph(
+                                    id="band-pie-graph",
+                                    style={"height": "260px"},
+                                    config={"displayModeBar": False},
+                                ),
                             ],
                         ),
                     ],
                 ),
+
+                # POINCARÉ PANELİ
                 html.Div(
                     style=PANEL_STYLE,
                     children=[
-                        html.H3("Poincaré & non-linear indices"),
+                        html.H3(
+                            "Poincaré & non-linear indices",
+                            style={"marginBottom": "2px", "fontSize": "16px"},
+                        ),
                         html.Span(
                             "Beat-to-beat dynamics and SD1/SD2 balance",
-                            style={"fontSize": "12px", "color": "#A0AEC0"},
+                            style={"fontSize": "12px", "color": PALETTE["muted"]},
                         ),
-                        dcc.Graph(id="poincare-graph", style={"height": "260px"}),
+                        dcc.Graph(
+                            id="poincare-graph",
+                            style={"height": "260px"},
+                            config={"displayModeBar": False},
+                        ),
                         html.Div(
                             id="poincare-metrics",
                             style={
@@ -297,44 +445,54 @@ app.layout = html.Div(
                                 "gridTemplateColumns": "repeat(2, 1fr)",
                                 "gridGap": "10px",
                             },
-                            children=[],
                         ),
                     ],
                 ),
             ],
         ),
 
+        # ---------- ALT STATUS BAR ---------- #
         html.Div(
             style={
-                "backgroundColor": "#223459",
-                "borderRadius": "10px",
-                "padding": "10px 5px",
+                "backgroundColor": PALETTE["card"],
+                "borderRadius": "16px",
+                "padding": "10px 14px",
                 "display": "flex",
                 "justifyContent": "space-between",
                 "alignItems": "center",
+                "border": f"1px solid {PALETTE['border']}",
+                "boxShadow": "0 6px 18px rgba(15, 23, 42, 0.04)",
             },
             children=[
                 html.Div(
                     id="status-bar",
                     children=[
-                        html.Span("Status: ", style={"fontWeight": "bold"}),
                         html.Span(
-                            id="status-text", children="Waiting for stream..."
+                            "Status: ",
+                            style={
+                                "fontWeight": "600",
+                                "marginRight": "4px",
+                            },
+                        ),
+                        html.Span(
+                            id="status-text",
+                            children="Waiting for stream...",
+                            style={"color": PALETTE["muted"]},
                         ),
                     ],
                 ),
                 html.Span(
                     id="signal-quality-text",
                     children="Signal quality: - · Source: Kafka stream",
-                    style={"fontSize": "12px", "color": "#A0AEC0"},
+                    style={"fontSize": "12px", "color": PALETTE["muted"]},
                 ),
             ],
         ),
     ],
 )
 
-# ----------------- CALLBACKS ----------------- #
 
+# ----------------- CALLBACKS ----------------- #
 
 @app.callback(
     Output("metrics-grid", "children"),
@@ -343,22 +501,15 @@ app.layout = html.Div(
     Input("window-dropdown", "value"),
 )
 def update_metrics_grid(n, subject_code, window_value):
-    if subject_code is None:
-        return [
-            metric_card("SDNN", "N/A", "ms"),
-            metric_card("RMSSD", "N/A", "ms"),
-            metric_card("pNN50", "N/A", "%"),
-            metric_card("Mean HR", "N/A", "bpm"),
-            metric_card("HR max", "N/A", "bpm"),
-            metric_card("HR min", "N/A", "bpm"),
-        ]
-
     window_s = _window_to_seconds(window_value)
-    params: Dict[str, Any] = {"subject": subject_code}
+
+    params = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
 
     metrics = _fetch_from_api("/metrics/time", params)
+    if not metrics:
+        metrics = get_time_domain_metrics(subject_code, window_length_s=window_s)
 
     cards = [
         metric_card("SDNN", _fmt(metrics.get("sdnn"), 1), "ms"),
@@ -378,40 +529,43 @@ def update_metrics_grid(n, subject_code, window_value):
     Input("window-dropdown", "value"),
 )
 def update_hr_graph(n, subject_code, window_value):
-    fig = go.Figure()
-
-    if subject_code is None:
-        fig.update_layout(
-            title="Heart rate over time",
-            xaxis_title="Time (s)",
-            yaxis_title="Heart Rate (bpm)",
-            template="plotly_dark",
-            margin=dict(l=40, r=20, t=40, b=40),
-            height=260,
-        )
-        return fig
-
     window_s = _window_to_seconds(window_value)
-    params: Dict[str, Any] = {"subject": subject_code}
+
+    # 1) API'den dene
+    params = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
+    data = _fetch_from_api("/metrics/hr_timeseries", params)
 
-    data = _fetch_from_api("/metrics/hr_series", params)
-    t_sec = data.get("t_sec", [])
-    hr_bpm = data.get("hr_bpm", [])
+    if data and data.get("t_sec") and data.get("hr_bpm"):
+        t_sec = np.array(data["t_sec"], dtype=float)
+        hr_bpm = np.array(data["hr_bpm"], dtype=float)
+    else:
+        # 2) API hata verirse / endpoint yoksa lokal servise fallback
+        t_sec, hr_bpm = get_hr_timeseries(subject_code, window_length_s=window_s)
 
-    if t_sec and hr_bpm:
+    fig = go.Figure()
+    if t_sec.size > 0 and hr_bpm.size > 0:
         fig.add_trace(
-            go.Scatter(x=t_sec, y=hr_bpm, mode="lines", name="Heart Rate")
+            go.Scatter(
+                x=t_sec,
+                y=hr_bpm,
+                mode="lines",
+                name="Heart Rate",
+                line=dict(width=2.4, color=PALETTE["primary"]),
+            )
         )
 
     fig.update_layout(
         title="Heart rate over time",
         xaxis_title="Time (s)",
         yaxis_title="Heart Rate (bpm)",
-        template="plotly_dark",
         margin=dict(l=40, r=20, t=40, b=40),
         height=260,
+        paper_bgcolor=PALETTE["bg"],
+        plot_bgcolor="#FFFFFF",
+        xaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
+        yaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
     )
     return fig
 
@@ -426,54 +580,64 @@ def update_hr_graph(n, subject_code, window_value):
 def update_frequency_domain_graphs(n, subject_code, window_value):
     window_s = _window_to_seconds(window_value)
 
-    fig_empty = go.Figure()
-    fig_empty.update_layout(
-        template="plotly_dark",
-        margin=dict(l=40, r=20, t=40, b=40),
-        height=230,
-    )
-
-    pie_empty = go.Figure(
-        data=[go.Pie(labels=["VLF", "LF", "HF"], values=[0, 0, 0], hole=0.3)]
-    )
-    pie_empty.update_layout(
-        title="VLF / LF / HF power distribution (Welch)",
-        template="plotly_dark",
-        margin=dict(l=20, r=20, t=30, b=30),
-        height=220,
-    )
-
-    if subject_code is None:
-        return fig_empty, pie_empty
-
-    params: Dict[str, Any] = {"subject": subject_code}
+    params = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
 
     fd = _fetch_from_api("/metrics/freq", params)
+    if not fd:
+        fd = get_freq_domain_metrics(subject_code, window_length_s=window_s)
+
     freq = np.array(fd.get("freq", []), dtype=float)
     psd = np.array(fd.get("psd", []), dtype=float)
     band_powers = fd.get("band_powers", {})
 
+    # Boş durum
     if freq.size == 0 or psd.size == 0:
-        return fig_empty, pie_empty
+        empty_fig = go.Figure()
+        empty_fig.update_layout(
+            template="plotly_white",
+            margin=dict(l=40, r=20, t=20, b=40),
+            height=230,
+            plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#FFFFFF",
+            xaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
+            yaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
+        )
+
+        pie_fig = go.Figure(
+            data=[
+                go.Pie(labels=["VLF", "LF", "HF"], values=[0, 0, 0], hole=0.55)
+            ]
+        )
+        pie_fig.update_layout(
+            title="VLF / LF / HF power distribution",
+            template="plotly_white",
+            margin=dict(l=10, r=10, t=30, b=20),
+            height=220,
+            showlegend=True,
+        )
+        return empty_fig, pie_fig
 
     max_psd = float(psd.max())
 
+    # PSD grafiği
     fig = go.Figure()
     fig.add_trace(
-        go.Scatter(x=freq, y=psd, mode="lines", name="PSD (Welch)")
+        go.Scatter(
+            x=freq,
+            y=psd,
+            mode="lines",
+            name="PSD (Welch)",
+            line=dict(width=2.5, color=PALETTE["primary"]),
+        )
     )
 
-    bands = {
-        "VLF": VLF_BAND,
-        "LF": LF_BAND,
-        "HF": HF_BAND,
-    }
+    bands = {"VLF": VLF_BAND, "LF": LF_BAND, "HF": HF_BAND}
     colors = {
-        "VLF": "rgba(56, 161, 105, 0.35)",
-        "LF": "rgba(66, 153, 225, 0.35)",
-        "HF": "rgba(237, 100, 166, 0.35)",
+        "VLF": "rgba(76, 111, 255, 0.08)",
+        "LF": "rgba(56, 161, 105, 0.10)",
+        "HF": "rgba(255, 139, 167, 0.12)",
     }
 
     shapes = []
@@ -488,7 +652,6 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
                 y0=0,
                 y1=max_psd * 1.05,
                 fillcolor=colors[name],
-                opacity=0.35,
                 line=dict(width=0),
                 layer="below",
             )
@@ -498,13 +661,18 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
         title="HRV power spectrum (Welch)",
         xaxis_title="Frequency (Hz)",
         yaxis_title="Power (ms²/Hz)",
-        template="plotly_dark",
-        margin=dict(l=40, r=20, t=40, b=40),
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=30, b=40),
         height=230,
         shapes=shapes,
-        legend=dict(orientation="h", y=-0.2),
+        legend=dict(orientation="h", y=-0.25),
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        xaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
+        yaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
     )
 
+    # Pasta grafiği
     labels = ["VLF", "LF", "HF"]
     values = [
         band_powers.get("VLF", 0.0),
@@ -513,13 +681,14 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
     ]
 
     pie_fig = go.Figure(
-        data=[go.Pie(labels=labels, values=values, hole=0.3)]
+        data=[go.Pie(labels=labels, values=values, hole=0.55)]
     )
     pie_fig.update_layout(
-        title="VLF / LF / HF power distribution (Welch)",
-        template="plotly_dark",
-        margin=dict(l=20, r=20, t=30, b=30),
+        title="VLF / LF / HF power distribution",
+        template="plotly_white",
+        margin=dict(l=10, r=10, t=30, b=20),
         height=220,
+        showlegend=True,
     )
 
     return fig, pie_fig
@@ -532,44 +701,42 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
     Input("window-dropdown", "value"),
 )
 def update_poincare_graph(n, subject_code, window_value):
-    fig = go.Figure()
-
-    if subject_code is None:
-        fig.update_layout(
-            title="Poincaré plot (RRn vs RRn+1)",
-            xaxis_title="RRₙ (ms)",
-            yaxis_title="RRₙ₊₁ (ms)",
-            template="plotly_dark",
-            margin=dict(l=40, r=20, t=40, b=40),
-            height=260,
-        )
-        return fig
-
     window_s = _window_to_seconds(window_value)
-    params: Dict[str, Any] = {"subject": subject_code}
+
+    params = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
 
     data = _fetch_from_api("/metrics/poincare", params)
+    if not data:
+        data = get_poincare_data(subject_code, window_length_s=window_s)
 
+    fig = go.Figure()
     if data.get("x") and data.get("y"):
         fig.add_trace(
             go.Scatter(
                 x=data["x"],
                 y=data["y"],
                 mode="markers",
-                marker=dict(size=4, opacity=0.6),
+                marker=dict(
+                    size=5,
+                    opacity=0.65,
+                    color=PALETTE["primary"],
+                ),
                 name="RRn vs RRn+1",
             )
         )
 
     fig.update_layout(
-        title="Poincaré plot (RRn vs RRn+1)",
         xaxis_title="RRₙ (ms)",
         yaxis_title="RRₙ₊₁ (ms)",
-        template="plotly_dark",
-        margin=dict(l=40, r=20, t=40, b=40),
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=10, b=40),
         height=260,
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        xaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
+        yaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
     )
     return fig
 
@@ -581,20 +748,15 @@ def update_poincare_graph(n, subject_code, window_value):
     Input("window-dropdown", "value"),
 )
 def update_poincare_metrics(n, subject_code, window_value):
-    if subject_code is None:
-        return [
-            metric_card("SD1", "N/A", "ms"),
-            metric_card("SD2", "N/A", "ms"),
-            metric_card("SD1/SD2 ratio", "N/A", ""),
-            metric_card("Stress index", "N/A", ""),
-        ]
-
     window_s = _window_to_seconds(window_value)
-    params: Dict[str, Any] = {"subject": subject_code}
+
+    params = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
 
     data = _fetch_from_api("/metrics/poincare", params)
+    if not data:
+        data = get_poincare_data(subject_code, window_length_s=window_s)
 
     cards = [
         metric_card("SD1", _fmt(data.get("sd1"), 1), "ms"),
@@ -611,12 +773,7 @@ def update_poincare_metrics(n, subject_code, window_value):
     Input("subject-dropdown", "value"),
 )
 def update_subject_info(n, subject_code):
-    if subject_code is None:
-        return [
-            html.Span("No subject selected", style={"fontWeight": "bold"}),
-        ]
-
-    info = _fetch_from_api(f"/subjects/{subject_code}")
+    info = get_subject_info(subject_code)
 
     age = info.get("age")
     sex = info.get("sex")
@@ -636,7 +793,7 @@ def update_subject_info(n, subject_code):
     return [
         html.Span(
             f"Subject {info.get('code', subject_code)}",
-            style={"fontWeight": "bold"},
+            style={"fontWeight": "600", "color": PALETTE["text"]},
         ),
         html.Br(),
         html.Span(f"Age: {age_str} · Sex: {sex_str}{group_str}"),
@@ -651,22 +808,15 @@ def update_subject_info(n, subject_code):
     Input("window-dropdown", "value"),
 )
 def update_status_bar(n, subject_code, window_value):
-    if subject_code is None:
-        status_msg = "No subject selected"
-        quality_msg = "Signal quality: - · Source: Kafka stream"
-        return status_msg, quality_msg
-
     window_s = _window_to_seconds(window_value)
-    params: Dict[str, Any] = {"subject": subject_code}
+
+    params = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
 
     status = _fetch_from_api("/metrics/status", params)
-
     if not status:
-        status_msg = "Collecting beats… (warming up or API error)"
-        quality_msg = "Signal quality: Unknown · Source: Kafka stream"
-        return status_msg, quality_msg
+        status = get_signal_status(subject_code, window_length_s=window_s)
 
     quality_label = status.get("quality_label", "Unknown")
     status_text = status.get("status_text", "No status available")
@@ -682,5 +832,8 @@ def update_status_bar(n, subject_code, window_value):
     return status_msg, quality_msg
 
 
+# ----------------- MAIN ----------------- #
+
 if __name__ == "__main__":
+    start_consumer_background()
     app.run(debug=True)

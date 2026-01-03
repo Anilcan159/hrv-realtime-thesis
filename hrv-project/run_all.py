@@ -1,4 +1,6 @@
-# Runs producer (optional) + Dash app in one command
+# run_all.py
+# Runs FastAPI HRV service + producer (optional) + Dash app in one command
+
 import os
 import sys
 import time
@@ -82,15 +84,34 @@ def main() -> None:
 
     procs: List[Tuple[str, subprocess.Popen]] = []
 
-    producer_cmd = [PY, str(ROOT / producer_module)]
+    # Komutlar
+    api_cmd = [
+        PY,
+        "-m",
+        "uvicorn",
+        "src.api.fastapi_app:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+        "--reload",
+    ]
     dash_cmd = [PY, str(ROOT / dash_module)]
+    producer_cmd = [PY, str(ROOT / producer_module)]
 
     try:
-        # 1) Dash'i önce başlat (UI hemen gelsin)
+        # 1) FastAPI HRV servisini başlat (rr_consumer burada startup'ta açılıyor)
+        api_proc = _popen(api_cmd, "api")
+        procs.append(("api", api_proc))
+
+        # Küçük bir nefes payı (API ayağa kalksın)
+        time.sleep(2.0)
+
+        # 2) Dash'i başlat (UI)
         dash_proc = _popen(dash_cmd, "dash")
         procs.append(("dash", dash_proc))
 
-        # 2) Producer (opsiyonel)
+        # 3) Producer (opsiyonel)
         if start_producer:
             _wait_for_kafka(host=kafka_host, port=kafka_port, timeout_s=30.0)
             producer_proc = _popen(producer_cmd, "producer")
@@ -108,10 +129,10 @@ def main() -> None:
                     continue  # hâlâ çalışıyor
 
                 # Process exit etmiş
-                if name == "dash":
-                    # Dash kritik: ölürse her şeyi kapat
-                    print(f"[run_all] dash exited (code={ret}). Shutting down...")
-                    raise RuntimeError(f"Dash exited unexpectedly (code={ret})")
+                if name in ("api", "dash"):
+                    # API veya Dash kritik: ölürse her şeyi kapat
+                    print(f"[run_all] {name} exited (code={ret}). Shutting down...")
+                    raise RuntimeError(f"{name} exited unexpectedly (code={ret})")
 
                 if name == "producer":
                     # Producer ölürse yeniden başlatmayı dene
@@ -122,7 +143,7 @@ def main() -> None:
                         procs[idx] = ("producer", new_p)
                     except Exception as e:
                         print(f"[run_all] failed to restart producer: {e}")
-                        # Producer'ı listeden çıkar, Dash çalışmaya devam etsin
+                        # Producer'ı listeden çıkar, diğerleri çalışmaya devam etsin
                         procs.pop(idx)
 
     except KeyboardInterrupt:
