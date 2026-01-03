@@ -1,34 +1,40 @@
+# src/dashboard/app.py
+"""
+Dash-based HRV live dashboard.
+
+Bu dashboard artik tamamen FastAPI'yi REST client olarak kullaniyor:
+    - Subject listesi   -> GET /subjects
+    - Subject bilgisi   -> GET /subjects/{subject_code}
+    - Time-domain       -> GET /metrics/time
+    - Freq-domain       -> GET /metrics/freq
+    - Poincare          -> GET /metrics/poincare
+    - Signal status     -> GET /metrics/status
+    - HR time-series    -> GET /metrics/hr_series
+
+Lokal service_hrv fonksiyonlarina veya rr_consumer'a dogrudan bagimlilik KALMADI.
+"""
+
 import os
 import sys
+from typing import Dict, Any
+
 import numpy as np
 from dash import Dash, html, dcc, Input, Output
 import plotly.graph_objects as go
-import requests 
+import requests
 
-# --- PROJE KÖKÜNÜ sys.path'E EKLE (ÖNCE BUNU YAP) --- #
+# --- PROJE KÖKÜNÜ sys.path'E EKLE --- #
 CURRENT_DIR = os.path.dirname(__file__)                  # .../src/dashboard
 PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))  # .../hrv-project
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-# Artık src.* importları güvenli
 from src.config.settings import settings
-from src.hrv_metrics.service_hrv import (
-    get_time_domain_metrics,
-    get_available_subject_codes,
-    get_hr_timeseries,
-    get_poincare_data,
-    get_subject_info,
-    get_freq_domain_metrics,
-    get_signal_status,
-)
-from src.streaming.rr_consumer import start_consumer_background
 
 
 app = Dash(__name__)
 
-subject_codes = get_available_subject_codes()
-
+# Panel stili
 PANEL_STYLE = {
     "backgroundColor": "#131F39",
     "border": "1px solid #223459",
@@ -40,11 +46,13 @@ PANEL_STYLE = {
 }
 
 
-def _fetch_from_api(path: str, params: dict) -> dict:
+def _fetch_from_api(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
     FastAPI HRV servisinden JSON veri çeker.
     Hata olursa bos dict dondurur.
     """
+    if params is None:
+        params = {}
     base_url = settings.api.base_url.rstrip("/")
     url = f"{base_url}{path}"
     try:
@@ -52,7 +60,7 @@ def _fetch_from_api(path: str, params: dict) -> dict:
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        # Buraya istersen logging de ekleyebilirsin
+        # Basit debug icin console'a yaz. Ileride logging'e tasinabilir.
         print(f"[dashboard] API request failed: {e} (url={url}, params={params})")
         return {}
 
@@ -118,6 +126,11 @@ def _fmt(v, nd: int = 1) -> str:
         return "N/A"
 
 
+# Subject listesi API'den cekilir (uygulama ayaga kalkarken bir kere deniyoruz)
+_subjects_resp = _fetch_from_api("/subjects")
+_subject_codes = _subjects_resp.get("subjects", [])
+
+
 app.layout = html.Div(
     style={
         "backgroundColor": "#131F39",
@@ -127,7 +140,6 @@ app.layout = html.Div(
         "fontFamily": "Arial, sans-serif",
     },
     children=[
-        # LIVE REFRESH (1s)
         dcc.Interval(id="refresh", interval=1000, n_intervals=0),
 
         html.Div(
@@ -165,9 +177,9 @@ app.layout = html.Div(
                                     id="subject-dropdown",
                                     options=[
                                         {"label": f"Subject {code}", "value": code}
-                                        for code in subject_codes
+                                        for code in _subject_codes
                                     ],
-                                    value=subject_codes[0] if subject_codes else None,
+                                    value=_subject_codes[0] if _subject_codes else None,
                                     clearable=False,
                                     style={"color": "#000000"},
                                 ),
@@ -188,7 +200,7 @@ app.layout = html.Div(
                                             "value": "last_5min",
                                         },
                                     ],
-                                    value="last_5min",  # canlıda default daha mantıklı
+                                    value="last_5min",
                                     clearable=False,
                                     style={"color": "#000000"},
                                 ),
@@ -269,7 +281,6 @@ app.layout = html.Div(
                         ),
                     ],
                 ),
-
                 html.Div(
                     style=PANEL_STYLE,
                     children=[
@@ -322,7 +333,7 @@ app.layout = html.Div(
     ],
 )
 
-# ----------------- CALLBACKS (NOW LIVE) ----------------- #
+# ----------------- CALLBACKS ----------------- #
 
 
 @app.callback(
@@ -332,15 +343,23 @@ app.layout = html.Div(
     Input("window-dropdown", "value"),
 )
 def update_metrics_grid(n, subject_code, window_value):
+    if subject_code is None:
+        return [
+            metric_card("SDNN", "N/A", "ms"),
+            metric_card("RMSSD", "N/A", "ms"),
+            metric_card("pNN50", "N/A", "%"),
+            metric_card("Mean HR", "N/A", "bpm"),
+            metric_card("HR max", "N/A", "bpm"),
+            metric_card("HR min", "N/A", "bpm"),
+        ]
+
     window_s = _window_to_seconds(window_value)
-    # 1) API'den dene
-    params = {"subject": subject_code}
+    params: Dict[str, Any] = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
+
     metrics = _fetch_from_api("/metrics/time", params)
-    # 2) API bos donerse (hata vs.), eski lokal fonksiyona fallback
-    if not metrics:
-        metrics = get_time_domain_metrics(subject_code, window_length_s=window_s)
+
     cards = [
         metric_card("SDNN", _fmt(metrics.get("sdnn"), 1), "ms"),
         metric_card("RMSSD", _fmt(metrics.get("rmssd"), 1), "ms"),
@@ -359,11 +378,29 @@ def update_metrics_grid(n, subject_code, window_value):
     Input("window-dropdown", "value"),
 )
 def update_hr_graph(n, subject_code, window_value):
-    window_s = _window_to_seconds(window_value)
-    t_sec, hr_bpm = get_hr_timeseries(subject_code, window_length_s=window_s)
-
     fig = go.Figure()
-    if len(t_sec) > 0 and len(hr_bpm) > 0:
+
+    if subject_code is None:
+        fig.update_layout(
+            title="Heart rate over time",
+            xaxis_title="Time (s)",
+            yaxis_title="Heart Rate (bpm)",
+            template="plotly_dark",
+            margin=dict(l=40, r=20, t=40, b=40),
+            height=260,
+        )
+        return fig
+
+    window_s = _window_to_seconds(window_value)
+    params: Dict[str, Any] = {"subject": subject_code}
+    if window_s is not None:
+        params["window_s"] = window_s
+
+    data = _fetch_from_api("/metrics/hr_series", params)
+    t_sec = data.get("t_sec", [])
+    hr_bpm = data.get("hr_bpm", [])
+
+    if t_sec and hr_bpm:
         fig.add_trace(
             go.Scatter(x=t_sec, y=hr_bpm, mode="lines", name="Heart Rate")
         )
@@ -389,37 +426,37 @@ def update_hr_graph(n, subject_code, window_value):
 def update_frequency_domain_graphs(n, subject_code, window_value):
     window_s = _window_to_seconds(window_value)
 
-    params = {"subject": subject_code}
+    fig_empty = go.Figure()
+    fig_empty.update_layout(
+        template="plotly_dark",
+        margin=dict(l=40, r=20, t=40, b=40),
+        height=230,
+    )
+
+    pie_empty = go.Figure(
+        data=[go.Pie(labels=["VLF", "LF", "HF"], values=[0, 0, 0], hole=0.3)]
+    )
+    pie_empty.update_layout(
+        title="VLF / LF / HF power distribution (Welch)",
+        template="plotly_dark",
+        margin=dict(l=20, r=20, t=30, b=30),
+        height=220,
+    )
+
+    if subject_code is None:
+        return fig_empty, pie_empty
+
+    params: Dict[str, Any] = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
 
     fd = _fetch_from_api("/metrics/freq", params)
-    if not fd:
-        fd = get_freq_domain_metrics(subject_code, window_length_s=window_s)
     freq = np.array(fd.get("freq", []), dtype=float)
     psd = np.array(fd.get("psd", []), dtype=float)
     band_powers = fd.get("band_powers", {})
 
     if freq.size == 0 or psd.size == 0:
-        empty_fig = go.Figure()
-        empty_fig.update_layout(
-            template="plotly_dark",
-            margin=dict(l=40, r=20, t=40, b=40),
-            height=230,
-        )
-
-        pie_fig = go.Figure(
-            data=[
-                go.Pie(labels=["VLF", "LF", "HF"], values=[0, 0, 0], hole=0.3)
-            ]
-        )
-        pie_fig.update_layout(
-            title="VLF / LF / HF power distribution (Welch)",
-            template="plotly_dark",
-            margin=dict(l=20, r=20, t=30, b=30),
-            height=220,
-        )
-        return empty_fig, pie_fig
+        return fig_empty, pie_empty
 
     max_psd = float(psd.max())
 
@@ -428,18 +465,16 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
         go.Scatter(x=freq, y=psd, mode="lines", name="PSD (Welch)")
     )
 
-    # Band sınırlarını konfigürasyondan al
     bands = {
         "VLF": VLF_BAND,
         "LF": LF_BAND,
         "HF": HF_BAND,
     }
     colors = {
-        "VLF": "rgba(56, 161, 105, 0.35)",   # biraz daha opak
+        "VLF": "rgba(56, 161, 105, 0.35)",
         "LF": "rgba(66, 153, 225, 0.35)",
         "HF": "rgba(237, 100, 166, 0.35)",
     }
-
 
     shapes = []
     for name, (f_low, f_high) in bands.items():
@@ -497,18 +532,26 @@ def update_frequency_domain_graphs(n, subject_code, window_value):
     Input("window-dropdown", "value"),
 )
 def update_poincare_graph(n, subject_code, window_value):
-    window_s = _window_to_seconds(window_value)
+    fig = go.Figure()
 
-    params = {"subject": subject_code}
+    if subject_code is None:
+        fig.update_layout(
+            title="Poincaré plot (RRn vs RRn+1)",
+            xaxis_title="RRₙ (ms)",
+            yaxis_title="RRₙ₊₁ (ms)",
+            template="plotly_dark",
+            margin=dict(l=40, r=20, t=40, b=40),
+            height=260,
+        )
+        return fig
+
+    window_s = _window_to_seconds(window_value)
+    params: Dict[str, Any] = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
 
     data = _fetch_from_api("/metrics/poincare", params)
-    if not data:
-        data = get_poincare_data(subject_code, window_length_s=window_s)
 
-
-    fig = go.Figure()
     if data.get("x") and data.get("y"):
         fig.add_trace(
             go.Scatter(
@@ -538,16 +581,20 @@ def update_poincare_graph(n, subject_code, window_value):
     Input("window-dropdown", "value"),
 )
 def update_poincare_metrics(n, subject_code, window_value):
-    window_s = _window_to_seconds(window_value)
+    if subject_code is None:
+        return [
+            metric_card("SD1", "N/A", "ms"),
+            metric_card("SD2", "N/A", "ms"),
+            metric_card("SD1/SD2 ratio", "N/A", ""),
+            metric_card("Stress index", "N/A", ""),
+        ]
 
-    params = {"subject": subject_code}
+    window_s = _window_to_seconds(window_value)
+    params: Dict[str, Any] = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
 
     data = _fetch_from_api("/metrics/poincare", params)
-    if not data:
-        data = get_poincare_data(subject_code, window_length_s=window_s)
-
 
     cards = [
         metric_card("SD1", _fmt(data.get("sd1"), 1), "ms"),
@@ -564,13 +611,17 @@ def update_poincare_metrics(n, subject_code, window_value):
     Input("subject-dropdown", "value"),
 )
 def update_subject_info(n, subject_code):
-    info = get_subject_info(subject_code)
+    if subject_code is None:
+        return [
+            html.Span("No subject selected", style={"fontWeight": "bold"}),
+        ]
+
+    info = _fetch_from_api(f"/subjects/{subject_code}")
 
     age = info.get("age")
     sex = info.get("sex")
     group = info.get("group")
 
-    # Pretty age
     if age is None:
         age_str = "Unknown"
     else:
@@ -600,16 +651,22 @@ def update_subject_info(n, subject_code):
     Input("window-dropdown", "value"),
 )
 def update_status_bar(n, subject_code, window_value):
-    window_s = _window_to_seconds(window_value)
+    if subject_code is None:
+        status_msg = "No subject selected"
+        quality_msg = "Signal quality: - · Source: Kafka stream"
+        return status_msg, quality_msg
 
-    params = {"subject": subject_code}
+    window_s = _window_to_seconds(window_value)
+    params: Dict[str, Any] = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
 
     status = _fetch_from_api("/metrics/status", params)
-    if not status:
-        status = get_signal_status(subject_code, window_length_s=window_s)
 
+    if not status:
+        status_msg = "Collecting beats… (warming up or API error)"
+        quality_msg = "Signal quality: Unknown · Source: Kafka stream"
+        return status_msg, quality_msg
 
     quality_label = status.get("quality_label", "Unknown")
     status_text = status.get("status_text", "No status available")

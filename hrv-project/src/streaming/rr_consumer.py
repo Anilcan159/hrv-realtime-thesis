@@ -69,7 +69,7 @@ def _run_consumer_forever() -> None:
                     rr_ms = float(data.get("rr_ms"))
 
                     GLOBAL_RR_BUFFER.add(subject=subject, rr_ms=rr_ms, ts=ts)
-                    # Burada log yazmıyoruz; her mesajı loglamak dosyayı şişirir.
+                    # Her mesajı loglamıyoruz; dosyayı şişirir.
                 except Exception as e:
                     logger.warning(
                         "Error while processing message from topic='%s': %r",
@@ -99,7 +99,9 @@ def _run_consumer_forever() -> None:
 
 def start_consumer_background() -> None:
     """
-    Dash uygulaması içinde, Kafka consumer'ı arka planda (daemon thread) başlatır.
+    Kafka consumer'ı arka planda (daemon thread) başlatır.
+
+    FastAPI startup event'inde veya başka bir servis tarafında çağrılmak üzere tasarlanmıştır.
     """
     global _consumer_thread
 
@@ -116,5 +118,5 @@ def start_consumer_background() -> None:
 
 if __name__ == "__main__":
     # Script direkt çalıştırılırsa foreground consumer olarak çalışır
-    logger.info("Starting foreground consumer loop (no Dash).")
+    logger.info("Starting foreground consumer loop (standalone).")
     _run_consumer_forever()

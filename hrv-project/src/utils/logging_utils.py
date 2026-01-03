@@ -18,7 +18,6 @@ Kullanım:
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
 
 # Proje kökü: .../hrv-project
 ROOT_DIR = Path(__file__).resolve().parents[2]
