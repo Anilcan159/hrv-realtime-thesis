@@ -1,10 +1,10 @@
 # src/streaming/preprocessing.py
 # Offline preprocessing:
 #   - Raw PhysioNet RR txt -> cleaned per-subject CSV
-#   - Fizyolojik filtre + güvenli interpolasyon + zaman / HR hesapları
+#   - Physiological filter + artifact correction + safe interpolation + time / HR
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -17,6 +17,7 @@ RAW_DATA_DIR: Path = settings.paths.raw_data_dir
 PROCESSED_DIR: Path = settings.paths.rr_processed_dir
 
 
+# Load raw RR series (ms) for a single subject.
 def load_rr_series(subject_id: str) -> pd.DataFrame:
     """
     Raw RR serisini (ms) tek sütunlu DataFrame olarak yükler.
@@ -31,8 +32,7 @@ def load_rr_series(subject_id: str) -> pd.DataFrame:
     return df
 
 
-# -------------------- YARDIMCI: FİZYOLOJİK FİLTRE -------------------- #
-
+# Mark RR values outside physiological bounds as NaN.
 def _mark_outliers_physio(
     rr_ms: pd.Series,
     rr_min: Optional[int] = None,
@@ -49,7 +49,7 @@ def _mark_outliers_physio(
 
     Not:
         300–2000 ms bandı, kısa süreli HRV çalışmalarında sık kullanılan
-        bir kaba fizyolojik aralıktır (yaklaşık 30–200 bpm).
+        kaba bir fizyolojik aralıktır (yaklaşık 30–200 bpm).
     """
     if rr_min is None:
         rr_min = settings.hrv.rr_min_ms
@@ -65,8 +65,69 @@ def _mark_outliers_physio(
     return rr
 
 
-# -------------------- YARDIMCI: KISA BOŞLUKLARI DOLDUR -------------------- #
+# Mark beats with abnormal beat-to-beat changes as NaN.
+def _mark_outliers_diff(
+    rr_ms: pd.Series,
+    rel_threshold: float = 0.20,
+    abs_threshold_ms: int = 200,
+) -> pd.Series:
+    """
+    Ardışık iki RR arasındaki farkın çok büyük olduğu beat'leri NaN yapar.
 
+    Kriterler (beat i için):
+        |RR_i - RR_{i-1}| > abs_threshold_ms  VEYA
+        |RR_i - RR_{i-1}| > rel_threshold * RR_{i-1}
+
+    HRV literatüründe ~%20–25 civarı relatif değişim ektopik / artefakt için
+    sık kullanılan bir eşiktir.
+    """
+    rr = pd.to_numeric(rr_ms, errors="coerce").astype(float).copy()
+    if rr.size < 2:
+        return rr
+
+    diff = np.abs(np.diff(rr))
+    prev = rr[:-1]
+
+    bad_from_diff = (diff > abs_threshold_ms) | (diff > rel_threshold * prev)
+
+    bad = np.zeros_like(rr, dtype=bool)
+    bad[1:] = bad_from_diff
+
+    rr[bad] = np.nan
+    return rr
+
+
+# Mark beats with large deviation from local median as NaN.
+def _mark_outliers_local_median(
+    rr_ms: pd.Series,
+    window_beats: int = 11,
+    rel_threshold: float = 0.20,
+) -> pd.Series:
+    """
+    Lokal medyan etrafında büyük sapma gösteren beat'leri NaN yapar.
+
+    Her beat için:
+        |RR_i - median_local| / median_local > rel_threshold  -> NaN
+
+    Bu yaklaşım, pek çok HRV yazılımında (Kubios benzeri) kullanılan
+    "local median filter" mantığını taklit eder.
+    """
+    rr = pd.to_numeric(rr_ms, errors="coerce").astype(float).copy()
+    if rr.size == 0:
+        return rr
+
+    s = pd.Series(rr)
+    med = s.rolling(window=window_beats, center=True, min_periods=1).median()
+
+    med_safe = med.replace(0.0, np.nan)
+    rel_dev = (np.abs(s - med_safe) / med_safe).fillna(0.0)
+
+    bad = rel_dev > rel_threshold
+    rr[bad.to_numpy()] = np.nan
+    return rr
+
+
+# Interpolate short NaN gaps and drop long unreliable segments.
 def _interpolate_short_gaps(
     rr_ms: np.ndarray,
     max_gap_beats: int = settings.hrv.max_gap_beats,
@@ -138,26 +199,37 @@ def _interpolate_short_gaps(
     return rr_clean
 
 
-# -------------------- ANA TEMİZLİK FONKSİYONU -------------------- #
-
+# Clean RR series using multi-stage artifact correction.
 def clean_rr_values(
     df: pd.DataFrame,
     rr_min: Optional[int] = None,
     rr_max: Optional[int] = None,
     max_gap_beats: Optional[int] = None,
-) -> pd.DataFrame:
+    rel_diff_threshold: float = 0.20,
+    abs_diff_threshold_ms: int = 200,
+    local_median_window: int = 11,
+    local_median_rel_threshold: float = 0.20,
+    return_stats: bool = False,
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Dict[str, Any]]]:
     """
-    Raw RR DataFrame'ini temizler:
+    Raw RR DataFrame'ini çok aşamalı artefakt düzeltmeyle temizler.
 
-    1) 'rr_ms' kolonunu sayısal tipe çevirir.
-    2) Fizyolojik aralık (rr_min–rr_max, ms) dışını NaN yapar.
-    3) Kısa NaN bloklarını (<= max_gap_beats) interpolasyonla düzeltir.
-    4) Uzun blokları tamamen atar.
-    5) Temiz RR serisini 'rr_ms' kolonu olarak döner.
+    Adımlar:
+      1) 'rr_ms' kolonunu sayısal tipe çevir.
+      2) Fizyolojik aralık (rr_min–rr_max, ms) dışını NaN yap (hard limits).
+      3) Ardışık RR fark filtresi (ectopic / missed beat / false detection).
+      4) Lokal medyan filtresi (sliding window).
+      5) Kısa NaN bloklarını (<= max_gap_beats) interpolasyonla düzelt.
+      6) Uzun blokları tamamen at.
+      7) Temiz RR serisini 'rr_ms' kolonu olarak döner;
+         istenirse temizlik istatistiklerini de döner.
 
-    Varsayılan parametreler, settings.hrv içinde tanımlıdır:
-        - rr_min_ms, rr_max_ms
-        - max_gap_beats
+    Tipik parametreler (HRV literatürü):
+      - rr_min_ms, rr_max_ms: ~300–2000 ms (≈30–200 bpm).
+      - rel_diff_threshold: ~0.20 (ardışık beat'te %20 değişim).
+      - abs_diff_threshold_ms: 200 ms (yavaş HR için ekstra limit).
+      - local_median_window: 11 beat (her beat etrafında ~10–12 beat).
+      - local_median_rel_threshold: ~0.20 (lokal medyan etrafında %20 sapma).
     """
     if rr_min is None:
         rr_min = settings.hrv.rr_min_ms
@@ -167,23 +239,54 @@ def clean_rr_values(
         max_gap_beats = settings.hrv.max_gap_beats
 
     df = df.copy()
+    rr_raw = pd.to_numeric(df["rr_ms"], errors="coerce").astype(float)
 
-    # 1) Fizyolojik outlier'ları NaN yap
-    rr_marked = _mark_outliers_physio(df["rr_ms"], rr_min=rr_min, rr_max=rr_max)
+    # 1) Hard physiological limits
+    rr_step1 = _mark_outliers_physio(rr_raw, rr_min=rr_min, rr_max=rr_max)
 
-    # 2) Kısa boşlukları doldur, uzun boşlukları dışla
-    rr_array = rr_marked.to_numpy()
+    # 2) Beat-to-beat difference filter
+    rr_step2 = _mark_outliers_diff(
+        rr_step1,
+        rel_threshold=rel_diff_threshold,
+        abs_threshold_ms=abs_diff_threshold_ms,
+    )
+
+    # 3) Local-median filter
+    rr_step3 = _mark_outliers_local_median(
+        rr_step2,
+        window_beats=local_median_window,
+        rel_threshold=local_median_rel_threshold,
+    )
+
+    # 4) Interpolate short gaps, drop long gaps
+    rr_array = rr_step3.to_numpy()
     rr_clean = _interpolate_short_gaps(rr_array, max_gap_beats=max_gap_beats)
 
-    # 3) Son DataFrame
-    df_clean = pd.DataFrame({"rr_ms": rr_clean})
-    df_clean = df_clean.reset_index(drop=True)
+    df_clean = pd.DataFrame({"rr_ms": rr_clean}).reset_index(drop=True)
 
-    return df_clean
+    if not return_stats:
+        return df_clean
+
+    # Basit temizlik istatistikleri
+    n_raw = int(rr_raw.size)
+    n_after_physio = int(np.isfinite(rr_step1).sum())
+    n_after_diff = int(np.isfinite(rr_step2).sum())
+    n_after_local = int(np.isfinite(rr_step3).sum())
+    n_final = int(rr_clean.size)
+
+    stats: Dict[str, Any] = {
+        "n_raw": n_raw,
+        "n_after_physio": n_after_physio,
+        "n_after_diff": n_after_diff,
+        "n_after_local": n_after_local,
+        "n_final": n_final,
+        "removed_pct_total": 100.0 * (n_raw - n_final) / max(n_raw, 1),
+    }
+
+    return df_clean, stats
 
 
-# -------------------- ZAMAN VE HR EKLE -------------------- #
-
+# Add cumulative time (s) and heart rate (bpm) columns.
 def add_time_and_hr(df: pd.DataFrame, subject_id: str) -> pd.DataFrame:
     """
     Temiz RR serisine:
@@ -205,19 +308,20 @@ def add_time_and_hr(df: pd.DataFrame, subject_id: str) -> pd.DataFrame:
     return df
 
 
-# -------------------- TEK BİR SUBJECT İŞLE -------------------- #
-
+# Run full preprocessing pipeline for a single subject.
 def process_single_subject(
     subject_id: str,
     rr_min: Optional[int] = None,
     rr_max: Optional[int] = None,
     max_gap_beats: Optional[int] = None,
+    log_stats: bool = True,
 ) -> None:
     """
     Tek bir subject için tam pipeline:
       raw txt -> temizlenmiş rr_ms + time_s + hr_bpm -> CSV.
 
-    Varsayılan temizleme parametreleri, settings.hrv üzerinden gelir.
+    Varsayılan temizleme parametreleri settings.hrv üzerinden gelir.
+    İstenirse, temizlik istatistikleri log'a yazılır.
     """
     if rr_min is None:
         rr_min = settings.hrv.rr_min_ms
@@ -229,12 +333,21 @@ def process_single_subject(
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     df_raw = load_rr_series(subject_id)
-    df_clean = clean_rr_values(
+    df_clean, stats = clean_rr_values(
         df_raw,
         rr_min=rr_min,
         rr_max=rr_max,
         max_gap_beats=max_gap_beats,
+        return_stats=True,
     )
+
+    if log_stats:
+        print(
+            f"[preprocessing] subject={subject_id} "
+            f"raw={stats['n_raw']} -> final={stats['n_final']} "
+            f"removed={stats['removed_pct_total']:.1f}%"
+        )
+
     df_final = add_time_and_hr(df_clean, subject_id)
 
     out_path = PROCESSED_DIR / f"{subject_id}_clean.csv"
@@ -242,8 +355,7 @@ def process_single_subject(
     print(f"[preprocessing] Saved: {out_path}")
 
 
-# -------------------- TÜM SUBJECT'LERİ İŞLE -------------------- #
-
+# Run preprocessing for all subjects in RAW_DATA_DIR.
 def process_all_subjects() -> None:
     """
     RAW_DATA_DIR içindeki tüm *.txt dosyalarını dolaşır,

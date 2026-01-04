@@ -42,12 +42,13 @@ VMD_TAU: float = 0.0
 VMD_INIT: int = 1
 VMD_TOL: float = 1e-7
 
-HRV_BANDS: Dict[str, Tuple[float, float]] = {
-    "HF":  (0.11, 0.40),
-    "LF":  (0.029, 0.14),
-    "VLF": (0.0047, 0.031),
-    "ULF": (0.0002, 0.0030),
+HRV_BANDS = {
+    "ULF": (0.0,    0.0047),  
+    "VLF": (0.0047, 0.0300),  
+    "LF":  (0.0300, 0.1400),
+    "HF":  (0.1100, 0.4000),
 }
+
 
 REQUIRED_BANDS: Tuple[str, ...] = ("HF", "LF", "VLF")
 
@@ -219,15 +220,27 @@ def assign_modes_to_bands(
         except Exception:
             omega_hz = None
 
+    # IMPORTANT: Use explicit band order to avoid VLF/LF overlap issues.
+    band_order = ["ULF", "VLF", "LF", "HF"]
+
     for i in range(modes.shape[0]):
         f_i = float(omega_hz[i]) if omega_hz is not None else compute_mode_peak_freq(modes[i], fs=fs)
 
         band_name = "?"
         if np.isfinite(f_i):
-            for name, (fmin, fmax) in HRV_BANDS.items():
-                if fmin <= f_i <= fmax:
+            for name in band_order:
+                fmin, fmax = HRV_BANDS[name]
+
+                # Half-open interval helps with boundary overlaps (e.g., 0.029-0.031 region).
+                if fmin <= f_i < fmax:
                     band_name = name
                     break
+
+            # If still unmatched and it's exactly the top HF edge, include it.
+            if band_name == "?" and "HF" in HRV_BANDS:
+                hf_min, hf_max = HRV_BANDS["HF"]
+                if np.isfinite(hf_max) and np.isclose(f_i, hf_max):
+                    band_name = "HF"
 
         mode_band[i] = band_name
         print(f"[INFO] Mode {i}: f={f_i:.5f} Hz -> {band_name}")
@@ -486,3 +499,6 @@ if __name__ == "__main__":
         use_omega=(not a.no_omega),
         dc=a.dc,
     )
+
+
+## python vmd_hrv_offline.py --subject 008 --method avmd --max-minutes 30 --detrend mean --kmin 4 --kmax 12 --energy-loss 0.05
