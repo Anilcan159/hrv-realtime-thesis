@@ -65,7 +65,7 @@ METRIC_CARD_STYLE = {
     "display": "flex",
     "flexDirection": "column",
     "gap": "6px",
-    "minHeight": "90px",
+    "minHeight": "70px",
     "border": f"1px solid {PALETTE['border']}",
     "alignItems": "center",       # ortala
     "justifyContent": "center",   # dikeyde ortala
@@ -190,105 +190,154 @@ app.layout = html.Div(
                 "marginBottom": "24px",
             },
             children=[
-                # SOL: Başlık + tagline
+                # SOL: Başlık + ikon + tagline
                 html.Div(
                     children=[
-                        html.H1(
-                            "HRV Live Dashboard",
+                        # Başlık + PNG aynı satırda
+                        html.Div(
                             style={
-                                "margin": 0,
-                                "fontSize": "28px",
-                                "fontWeight": "700",
-                                "letterSpacing": "0.02em",
+                                "display": "flex",
+                                "alignItems": "center",
+                                "gap": "10px",
                             },
+                            children=[
+                                html.H1(
+                                    "HRV Live Dashboard",
+                                    style={
+                                        "margin": 0,
+                                        "fontSize": "75px",   # büyütülmüş font
+                                        "fontWeight": "700",
+                                        "letterSpacing": "0.02em",
+                                    },
+                                ),
+                                html.Img(
+                                    src="/assets/hrv_wave.png",
+                                    style={
+                                        "height": "75px",
+                                        "display": "block",
+                                    },
+                                ),
+                            ],
                         ),
+                        # Alt satır: tagline
                         html.Span(
                             "Real-time heart rate variability monitoring",
                             style={
-                                "fontSize": "13px",
+                                "fontSize": "20px",
                                 "color": PALETTE["muted"],
                             },
                         ),
-                    ]
+                    ],
                 ),
 
-                # SAĞ: Dropdown'lar + en sağda PNG ikon
+                # SAĞ: Subject figürü + dropdown card
                 html.Div(
                     style={
                         "display": "flex",
                         "alignItems": "center",
-                        "gap": "24px",
+                        "gap": "18px",
                     },
                     children=[
-                        # Dropdown'lar
+                        # Sol: subject figürü
+                        html.Img(
+                            id="subject-figure",
+                            src=app.get_asset_url("Man.png"),   # başlangıçta kadın ya da herhangi biri
+                            style={
+                                "height": "160px",
+                                "width": "auto",
+                                "display": "block",
+                            },
+                        ),
+
+                        # Sağ: dropdown kartı
                         html.Div(
                             style={
-                                "minWidth": "280px",
+                                "minWidth": "340px",
+                                "backgroundColor": PALETTE["card"],
+                                "borderRadius": "18px",
+                                "padding": "12px 14px",
+                                "boxShadow": "0 10px 26px rgba(15, 23, 42, 0.06)",
+                                "border": f"1px solid {PALETTE['border']}",
                                 "display": "flex",
                                 "flexDirection": "column",
-                                "gap": "8px",
+                                "gap": "10px",
                             },
                             children=[
-                                html.Div(
-                                    children=[
-                                        html.Label(
-                                            "Subject / Session",
-                                            style={
-                                                "fontSize": "12px",
-                                                "marginBottom": "4px",
-                                                "color": PALETTE["muted"],
-                                            },
-                                        ),
-                                        dcc.Dropdown(
-                                            id="subject-dropdown",
-                                            options=[
-                                                {
-                                                    "label": f"Subject {code}",
-                                                    "value": code,
-                                                }
-                                                for code in subject_codes
-                                            ],
-                                            value=subject_codes[0]
-                                            if subject_codes
-                                            else None,
-                                            clearable=False,
-                                            style={
-                                                "color": "#111111",
-                                                "backgroundColor": "#FFFFFF",
-                                            },
-                                        ),
-                                    ]
+                                html.Span(
+                                    "Recording selection",
+                                    style={
+                                        "fontSize": "11px",
+                                        "letterSpacing": "0.12em",
+                                        "textTransform": "uppercase",
+                                        "color": PALETTE["muted"],
+                                        "fontWeight": "600",
+                                    },
                                 ),
                                 html.Div(
+                                    style={
+                                        "display": "grid",
+                                        "gridTemplateColumns": "1.1fr 0.9fr",
+                                        "gridGap": "8px",
+                                    },
                                     children=[
-                                        html.Label(
-                                            "Analysis window",
-                                            style={
-                                                "fontSize": "12px",
-                                                "marginBottom": "4px",
-                                                "color": PALETTE["muted"],
-                                            },
+                                        # Subject dropdown
+                                        html.Div(
+                                            children=[
+                                                html.Label(
+                                                    "Subject / Session",
+                                                    style={
+                                                        "fontSize": "12px",
+                                                        "marginBottom": "4px",
+                                                        "color": PALETTE["muted"],
+                                                    },
+                                                ),
+                                                dcc.Dropdown(
+                                                    id="subject-dropdown",
+                                                    options=[
+                                                        {
+                                                            "label": f"Subject {code}",
+                                                            "value": code,
+                                                        }
+                                                        for code in subject_codes
+                                                    ],
+                                                    value=subject_codes[0] if subject_codes else None,
+                                                    clearable=False,
+                                                    style={
+                                                        "color": "#111111",
+                                                        "backgroundColor": "#FFFFFF",
+                                                        "fontSize": "13px",
+                                                    },
+                                                ),
+                                            ]
                                         ),
-                                        dcc.Dropdown(
-                                            id="window-dropdown",
-                                            options=[
-                                                {
-                                                    "label": "Full recording",
-                                                    "value": "full",
-                                                },
-                                                {
-                                                    "label": "Last 5 minutes",
-                                                    "value": "last_5min",
-                                                },
-                                            ],
-                                            value="last_5min",
-                                            clearable=False,
-                                            style={
-                                                "color": "#111111",
-                                                "backgroundColor": "#FFFFFF",
-                                            },
+                                        # Window dropdown
+                                        html.Div(
+                                            children=[
+                                                html.Label(
+                                                    "Analysis window",
+                                                    style={
+                                                        "fontSize": "12px",
+                                                        "marginBottom": "4px",
+                                                        "color": PALETTE["muted"],
+                                                    },
+                                                ),
+                                                dcc.Dropdown(
+                                                    id="window-dropdown",
+                                                    options=[
+                                                        {"label": "Full recording", "value": "full"},
+                                                        {"label": "Last 5 minutes", "value": "last_5min"},
+                                                    ],
+                                                    value="last_5min",
+                                                    clearable=False,
+                                                    style={
+                                                        "color": "#111111",
+                                                        "backgroundColor": "#FFFFFF",
+                                                        "fontSize": "13px",
+                                                    },
+                                                ),
+                                            ]
                                         ),
-                                    ]
+                                    ],
                                 ),
                                 html.Div(
                                     id="subject-info",
@@ -301,26 +350,15 @@ app.layout = html.Div(
                                 ),
                             ],
                         ),
-
-                        # En sağ: HRV dalga PNG
-                        html.Img(
-                            src="/assets/hrv_wave.png",   # assets klasöründeki dosya
-                            style={
-                                "height": "40px",
-                                "display": "block",
-                            },
-                        ),
                     ],
                 ),
             ],
         ),
-
-
         # ---------- ANA GRID (3 PANEL) ---------- #
         html.Div(
             style={
                 "display": "grid",
-                "gridTemplateColumns": "1.4fr 1fr 1fr",
+                "gridTemplateColumns": "1fr 1.6fr 1fr",
                 "gridGap": "20px",
                 "marginBottom": "18px",
             },
@@ -387,39 +425,32 @@ app.layout = html.Div(
 
                 # FREQUENCY-DOMAIN PANEL
                 html.Div(
-                    style=PANEL_STYLE,
-                    children=[
-                        html.H3(
-                            "Frequency-domain metrics",
-                            style={"marginBottom": "2px", "fontSize": "16px"},
-                        ),
-                        html.Span(
-                            "Spectral power (Welch) and VLF / LF / HF distribution",
-                            style={"fontSize": "12px", "color": PALETTE["muted"]},
-                        ),
-                        html.Div(
-                            style={
-                                "display": "grid",
-                                "gridTemplateColumns": "1.6fr 1fr",
-                                "gridGap": "10px",
-                                "marginTop": "10px",
-                                "alignItems": "stretch",
-                            },
-                            children=[
-                                dcc.Graph(
-                                    id="lf-hf-graph",
-                                    style={"height": "260px"},
-                                    config={"displayModeBar": False},
-                                ),
-                                dcc.Graph(
-                                    id="band-pie-graph",
-                                    style={"height": "260px"},
-                                    config={"displayModeBar": False},
-                                ),
-                            ],
-                        ),
-                    ],
-                ),
+                style=PANEL_STYLE,
+                children=[
+                    html.H3(
+                        "Frequency-domain metrics",
+                        style={"marginBottom": "2px", "fontSize": "16px"},
+                    ),
+                    html.Span(
+                        "Spectral power (Welch) and VLF / LF / HF distribution",
+                        style={"fontSize": "12px", "color": PALETTE["muted"]},
+                    ),
+
+                    # Üstte: PSD grafiği (tam genişlik)
+                    dcc.Graph(
+                        id="lf-hf-graph",
+                        style={"height": "260px", "marginTop": "10px"},
+                        config={"displayModeBar": False},
+                    ),
+
+                    # Altta: Pie chart (tam genişlik)
+                    dcc.Graph(
+                        id="band-pie-graph",
+                        style={"height": "230px", "marginTop": "6px"},
+                        config={"displayModeBar": False},
+                    ),
+                ],
+            ),
 
                 # POINCARÉ PANELİ
                 html.Div(
@@ -769,6 +800,7 @@ def update_poincare_metrics(n, subject_code, window_value):
 
 @app.callback(
     Output("subject-info", "children"),
+    Output("subject-figure", "src"),
     Input("refresh", "n_intervals"),
     Input("subject-dropdown", "value"),
 )
@@ -779,6 +811,7 @@ def update_subject_info(n, subject_code):
     sex = info.get("sex")
     group = info.get("group")
 
+    # Age string
     if age is None:
         age_str = "Unknown"
     else:
@@ -790,7 +823,20 @@ def update_subject_info(n, subject_code):
     sex_str = "-" if sex in (None, "", float("nan")) else str(sex)
     group_str = "" if group in (None, "") else f" · Group: {group}"
 
-    return [
+    # ---- FIGURE SEÇİMİ ----
+    sex_norm = str(sex).strip().lower() if sex is not None else ""
+
+    if sex_norm.startswith("m"):
+        filename = "Man.png"      # VSCode’daki isimle birebir aynı!
+    elif sex_norm.startswith("f"):
+        filename = "woman.png"
+    else:
+        filename = "woman.png"    # default
+
+    figure_src = app.get_asset_url(filename)
+
+    # ---- TEXT ----
+    info_children = [
         html.Span(
             f"Subject {info.get('code', subject_code)}",
             style={"fontWeight": "600", "color": PALETTE["text"]},
@@ -799,6 +845,7 @@ def update_subject_info(n, subject_code):
         html.Span(f"Age: {age_str} · Sex: {sex_str}{group_str}"),
     ]
 
+    return info_children, figure_src
 
 @app.callback(
     Output("status-text", "children"),

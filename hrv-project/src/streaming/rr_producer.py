@@ -39,7 +39,7 @@ KAFKA_BOOTSTRAP: str = settings.kafka.bootstrap_servers
 KAFKA_TOPIC: str = settings.kafka.rr_topic
 
 # Ust limit for concurrently streamed subjects (demo-friendly)
-DEFAULT_SUBJECT_LIMIT: int = 8
+DEFAULT_SUBJECT_LIMIT: int = 20
 
 # Module-level logger
 logger = get_logger(module_name="rr_producer", logfile_name="producer.log")
