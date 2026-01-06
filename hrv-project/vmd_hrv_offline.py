@@ -35,6 +35,11 @@ from vmdpy import VMD
 ROOT_DIR = Path(__file__).resolve().parent
 RR_DIR = ROOT_DIR / "data" / "processed" / "rr_clean"
 
+# Çıktı klasörleri
+PLOT_DIR = ROOT_DIR / "data" / "plots"
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+SUMMARY_PATH = PLOT_DIR / "band_summary.csv"
+
 FS_RESAMPLE: float = 2.0  # Hz
 
 VMD_ALPHA: float = 2000.0
@@ -43,12 +48,11 @@ VMD_INIT: int = 1
 VMD_TOL: float = 1e-7
 
 HRV_BANDS = {
-    "ULF": (0.0,    0.0047),  
-    "VLF": (0.0047, 0.0300),  
+    "ULF": (0.0,    0.0047),
+    "VLF": (0.0047, 0.0300),
     "LF":  (0.0300, 0.1400),
     "HF":  (0.1100, 0.4000),
 }
-
 
 REQUIRED_BANDS: Tuple[str, ...] = ("HF", "LF", "VLF")
 
@@ -73,7 +77,7 @@ def load_rr_sec_from_clean(subject_code: str) -> np.ndarray:
     except ValueError:
         candidates = [RR_DIR / f"{subject_code}_clean.csv"]
 
-    csv_path = None
+    csv_path = None    # type: ignore
     for c in candidates:
         if c.exists():
             csv_path = c
@@ -313,6 +317,7 @@ def run_avmd_hrv(
 # ----------------- VMDON (offline emülasyon) ----------------- #
 
 def _sliding_component(signal: np.ndarray, fs: float, window_s: float, use_vmd: bool, alpha: float, stride: int) -> np.ndarray:
+    """Compute one sliding-window component (HF/LF/VLF/ULF)."""
     x = np.asarray(signal, dtype=float)
     N = x.size
     W = int(round(window_s * fs))
@@ -345,6 +350,7 @@ def _sliding_component(signal: np.ndarray, fs: float, window_s: float, use_vmd: 
 
 
 def vmdon_offline(hrv: np.ndarray, fs: float, stride_hf: int = 1, stride_lf: int = 2, stride_vlf: int = 10, stride_ulf: int = 60) -> Dict[str, np.ndarray]:
+    """VMDon-like offline decomposition with sliding windows."""
     x = np.asarray(hrv, dtype=float)
 
     hf = _sliding_component(x, fs, VMDON_WINDOW_S["HF"], True, VMD_ALPHA, stride_hf)
@@ -364,6 +370,7 @@ def vmdon_offline(hrv: np.ndarray, fs: float, stride_hf: int = 1, stride_lf: int
 # ----------------- HILBERT AM/FM ----------------- #
 
 def hilbert_am_fm(x: np.ndarray, fs: float, sg_window_s: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute smoothed Hilbert amplitude and instantaneous frequency."""
     x = np.asarray(x, dtype=float)
     analytic = hilbert(x)
     amp = np.abs(analytic)
@@ -387,7 +394,15 @@ def hilbert_am_fm(x: np.ndarray, fs: float, sg_window_s: Optional[float] = None)
 
 # ----------------- PLOT & SUMMARY ----------------- #
 
-def plot_components(t: np.ndarray, hrv: np.ndarray, comps: Dict[str, np.ndarray], subject: str, method: str) -> None:
+def plot_components(
+    t: np.ndarray,
+    hrv: np.ndarray,
+    comps: Dict[str, np.ndarray],
+    subject: str,
+    method: str,
+    save: bool = True,
+) -> None:
+    """Plot HRV components and optionally save to PNG."""
     fig, axes = plt.subplots(5, 1, figsize=(14, 8), sharex=True)
 
     axes[0].plot(t, hrv, linewidth=0.8)
@@ -402,17 +417,44 @@ def plot_components(t: np.ndarray, hrv: np.ndarray, comps: Dict[str, np.ndarray]
 
     axes[-1].set_xlabel("Time (s)")
     plt.tight_layout()
-    plt.show()
+
+    if save:
+        out_dir = PLOT_DIR / method
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{subject}_{method}_components.png"
+        plt.savefig(out_path, dpi=200)
+        print(f"[INFO] Saved plot to {out_path}")
+        plt.close(fig)
+    else:
+        plt.show()
 
 
-def print_band_summary(comps: Dict[str, np.ndarray]) -> None:
+def print_band_summary(comps: Dict[str, np.ndarray], subject: str, method: str) -> None:
+    """Print and append band stats to CSV."""
     print("\n[SUMMARY] Band powers (variance) & basic stats:")
+    rows = []
     for band, x in comps.items():
         x = np.asarray(x, dtype=float)
         mean = float(np.mean(x))
         var = float(np.var(x))
         var_demean = float(np.var(x - mean))
         print(f"  {band}: var={var:.6e}, mean={mean:.4f}, var_demean={var_demean:.6e}")
+
+        rows.append(
+            {
+                "subject": subject,
+                "method": method,
+                "band": band,
+                "var": var,
+                "mean": mean,
+                "var_demean": var_demean,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    header = not SUMMARY_PATH.exists()
+    df.to_csv(SUMMARY_PATH, mode="a", index=False, header=header)
+    print(f"[INFO] Appended band summary to {SUMMARY_PATH}")
 
 
 # ----------------- MAIN ----------------- #
@@ -428,6 +470,7 @@ def run_for_subject(
     use_omega: bool,
     dc: int,
 ) -> None:
+    """Main offline pipeline for one subject."""
     rr = load_rr_sec_from_clean(subject)
     print(f"[INFO] Loaded {rr.size} RR intervals (sec) for subject={subject}")
     print(f"[INFO] Approx duration: {rr.sum()/60.0:.1f} minutes")
@@ -462,8 +505,9 @@ def run_for_subject(
     else:
         raise ValueError("Unknown method")
 
+    # PNG + CSV çıktıları
     plot_components(t[:comps["HF"].size], hrv_p[:comps["HF"].size], comps, subject, method)
-    print_band_summary(comps)
+    print_band_summary(comps, subject, method)
 
     print("\n[INFO] Example AM/FM for HF band (first 10 minutes segment).")
     mask = t <= 10*60.0
@@ -500,5 +544,5 @@ if __name__ == "__main__":
         dc=a.dc,
     )
 
-
-## python vmd_hrv_offline.py --subject 008 --method avmd --max-minutes 30 --detrend mean --kmin 4 --kmax 12 --energy-loss 0.05
+# Örnek:
+# python vmd_hrv_offline.py --subject 003 --method avmd --max-minutes 30 --detrend mean --kmin 4 --kmax 12 --energy-loss 0.05

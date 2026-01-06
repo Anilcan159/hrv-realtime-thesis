@@ -1,488 +1,201 @@
-"""
-vmd_hrv_offline.py (optimized)
-
-Offline HRV bileşen analizi:
-- rr_clean klasöründeki *_clean.csv dosyalarından RR okur
-- RR -> 2 Hz uniform HRV(t) sinyaline çevirir
-- Üç yöntemden biriyle HF / LF / VLF / ULF bileşenlerini çıkarır:
-    * klasik VMD      (--method vmd)
-    * adaptif VMD     (--method avmd)  [HRV-odaklı, band coverage + energy loss]
-    * VMDon benzeri   (--method vmdon) [sliding-window, offline emülasyon]
-
-İyileştirmeler (AVMD tarafı):
-- K seçimi sadece "reconstruction error" ile değil, HRV band kapsaması ile birlikte yapılır
-  (HF/LF/VLF en az birer moda sahip olana kadar K artar; ardından energy loss eşiği kontrol edilir).
-- Mode band ataması Welch "peak bin" yerine (varsa) VMD'nin omega merkez frekansları ile yapılır.
-- 30 dk pencerede ULF'nin zayıf/boş olması normal kabul edilir.
-"""
-
-import argparse
 from pathlib import Path
-from typing import Dict, Tuple, List, Literal, Optional, Iterable, Any
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
-from scipy.interpolate import CubicSpline
-from scipy.signal import welch, hilbert, savgol_filter
+# Project paths
+ROOT = Path(__file__).resolve().parent
+TFM_PATH = ROOT / "Datas" / "raw" / "TFM.csv"
+OUT_DIR = ROOT / "data" / "processed" / "rr_clean"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-from vmdpy import VMD
-
-
-# ----------------- PATH & GLOBAL CONFIG ----------------- #
-
-ROOT_DIR = Path(__file__).resolve().parent
-RR_DIR = ROOT_DIR / "data" / "processed" / "rr_clean"
-
-FS_RESAMPLE: float = 2.0  # Hz
-
-VMD_ALPHA: float = 2000.0
-VMD_TAU: float = 0.0
-VMD_INIT: int = 1
-VMD_TOL: float = 1e-7
-
-HRV_BANDS: Dict[str, Tuple[float, float]] = {
-    "HF":  (0.11, 0.40),
-    "LF":  (0.029, 0.14),
-    "VLF": (0.0047, 0.031),
-    "ULF": (0.0002, 0.0030),
-}
-
-REQUIRED_BANDS: Tuple[str, ...] = ("HF", "LF", "VLF")
-
-VMDON_WINDOW_S: Dict[str, float] = {
-    "HF": 6.5,
-    "LF": 25.0,
-    "VLF": 303.0,
-    "ULF": 1800.0,
-}
+MAP_PATH = ROOT / "data" / "processed" / "patient-anon-map.csv"
 
 
-# ----------------- LOAD & RESAMPLE ----------------- #
-
-def load_rr_sec_from_clean(subject_code: str) -> np.ndarray:
-    """Load cleaned RR series (seconds) for a subject."""
-    try:
-        code_int = int(subject_code)
-        candidates = [
-            RR_DIR / f"{code_int}_clean.csv",
-            RR_DIR / f"{code_int:03d}_clean.csv",
-        ]
-    except ValueError:
-        candidates = [RR_DIR / f"{subject_code}_clean.csv"]
-
-    csv_path = None
-    for c in candidates:
-        if c.exists():
-            csv_path = c
-            break
-
-    if csv_path is None:
-        raise FileNotFoundError(f"No RR file found for subject={subject_code} in {RR_DIR}")
-
-    print(f"[INFO] Using RR file: {csv_path}")
-    df = pd.read_csv(csv_path)
-
-    rr_col_candidates = ["rr_sec", "rr_s", "rr", "rr_ms"]
-    rr_col = None
-    for col in rr_col_candidates:
-        if col in df.columns:
-            rr_col = col
-            break
-    if rr_col is None:
-        raise ValueError(f"Could not find RR column in {csv_path}. Available: {list(df.columns)}")
-
-    rr = df[rr_col].to_numpy(dtype=float)
-
-    if rr_col.lower().endswith("ms"):
-        rr_sec = rr / 1000.0
-    else:
-        rr_sec = rr
-
-    rr_sec = rr_sec[np.isfinite(rr_sec)]
-    rr_sec = rr_sec[rr_sec > 0.1]
-    return rr_sec
+def find_hr_columns(df: pd.DataFrame) -> List[str]:
+    """Find columns that look like HR (bpm) signals."""
+    hr_cols = []
+    for col in df.columns:
+        col_str = str(col)
+        if "HeartRate" in col_str or "HRM" in col_str:
+            hr_cols.append(col)
+    return hr_cols
 
 
-def rr_to_uniform_hrv(
-    rr_sec: np.ndarray,
-    fs: float = FS_RESAMPLE,
-    max_minutes: Optional[float] = None
-) -> Tuple[np.ndarray, np.ndarray]:
-    """RR (s) -> uniform HRV(t) (fs Hz) via cubic spline."""
-    rr_sec = np.asarray(rr_sec, dtype=float)
-    if rr_sec.size == 0:
-        return np.asarray([]), np.asarray([])
-
-    t_rr = np.cumsum(rr_sec)
-    t_rr = t_rr - t_rr[0]
-
-    if max_minutes is not None:
-        max_t = max_minutes * 60.0
-        mask = t_rr <= max_t
-        if mask.sum() >= 4:
-            rr_sec = rr_sec[mask]
-            t_rr = t_rr[mask]
-
-    total_dur = float(t_rr[-1])
-    dt = 1.0 / fs
-    t_uniform = np.arange(0.0, total_dur, dt)
-
-    if t_uniform.size < 4:
-        hrv = np.interp(t_uniform, t_rr, rr_sec)
-        return t_uniform, hrv
-
-    cs = CubicSpline(t_rr, rr_sec)
-    hrv = cs(t_uniform)
-    return t_uniform, hrv
+def find_time_column(df: pd.DataFrame) -> str:
+    """Find the TIME-like column (case-insensitive, strip spaces)."""
+    for col in df.columns:
+        if "TIME" in str(col).upper().strip():
+            return col
+    raise ValueError(f"No TIME-like column found. Columns: {list(df.columns)}")
 
 
-# ----------------- PREPROCESS ----------------- #
-
-def detrend_signal(x: np.ndarray, mode: Literal["none", "mean", "linear"] = "mean") -> np.ndarray:
-    """Detrend HRV signal (none/mean/linear)."""
-    x = np.asarray(x, dtype=float)
-    if mode == "none":
-        return x
-    if mode == "mean":
-        return x - np.mean(x)
-    if mode == "linear":
-        t = np.arange(x.size, dtype=float)
-        p = np.polyfit(t, x, 1)
-        return x - np.polyval(p, t)
-    raise ValueError(f"Unknown detrend mode: {mode}")
-
-
-# ----------------- VMD helpers ----------------- #
-
-def run_vmd(signal: np.ndarray, K: int, alpha: float, dc: int) -> Tuple[np.ndarray, Any]:
-    """Run VMD and return modes + omega."""
-    signal = np.asarray(signal, dtype=float)
-    if signal.ndim != 1 or signal.size < 10:
-        raise ValueError("Signal too short for VMD.")
-
-    u, u_hat, omega = VMD(signal, alpha, VMD_TAU, K, dc, VMD_INIT, VMD_TOL)
-    return u, omega
-
-
-def _omega_to_hz(omega: np.ndarray, fs: float) -> np.ndarray:
-    """
-    Convert VMD omega output to Hz in a robust way.
-    Common cases:
-      - cycles/sample in [0..0.5]  => Hz = omega * fs
-      - rad/sample   in [0..pi]    => Hz = omega * fs / (2*pi)
-    """
-    om = np.asarray(omega, dtype=float)
-    if om.ndim == 2:
-        om = om[-1]  # final iteration row
-    om = np.asarray(om).reshape(-1)
-
-    if om.size == 0 or not np.isfinite(np.nanmax(om)):
-        return om
-
-    max_om = float(np.nanmax(om))
-    if max_om <= 0.5 + 1e-6:
-        return om * fs
-    if max_om <= np.pi + 1e-6:
-        return om * fs / (2.0 * np.pi)
-    return om  # assume already Hz
-
-
-def compute_mode_peak_freq(mode: np.ndarray, fs: float, nperseg: int = 1024) -> float:
-    """Welch PSD peak frequency (fallback)."""
-    mode = np.asarray(mode, dtype=float)
-    if mode.size < 8:
+def parse_time_to_seconds(s: str) -> float:
+    """Parse TIME like '06:29:23 132' -> seconds from midnight."""
+    if pd.isna(s):
         return np.nan
-    nps = min(nperseg, mode.size)
-    f, Pxx = welch(mode, fs=fs, nperseg=nps)
-    if f.size == 0:
-        return np.nan
-    return float(f[int(np.argmax(Pxx))])
-
-
-def assign_modes_to_bands(
-    modes: np.ndarray,
-    fs: float,
-    omega: Optional[Any] = None,
-    use_omega: bool = True
-) -> Dict[int, str]:
-    """Assign each mode to a HRV band using omega (preferred) or Welch peak freq."""
-    mode_band: Dict[int, str] = {}
-
-    omega_hz: Optional[np.ndarray] = None
-    if use_omega and omega is not None:
+    s = str(s).strip()
+    parts = s.split()
+    hms = parts[0]
+    ms = 0.0
+    if len(parts) > 1:
+        # '132' -> 0.132 s varsayımı
         try:
-            omega_hz = _omega_to_hz(np.asarray(omega), fs=fs)
-            if omega_hz.size != modes.shape[0]:
-                omega_hz = None
-        except Exception:
-            omega_hz = None
+            ms = float(parts[1]) / 1000.0
+        except ValueError:
+            ms = 0.0
 
-    for i in range(modes.shape[0]):
-        f_i = float(omega_hz[i]) if omega_hz is not None else compute_mode_peak_freq(modes[i], fs=fs)
+    try:
+        h, m, sec = hms.split(":")
+        h = float(h)
+        m = float(m)
+        sec = float(sec.replace(",", "."))
+    except Exception:
+        return np.nan
 
-        band_name = "?"
-        if np.isfinite(f_i):
-            for name, (fmin, fmax) in HRV_BANDS.items():
-                if fmin <= f_i <= fmax:
-                    band_name = name
-                    break
-
-        mode_band[i] = band_name
-        print(f"[INFO] Mode {i}: f={f_i:.5f} Hz -> {band_name}")
-
-    return mode_band
+    return h * 3600.0 + m * 60.0 + sec + ms
 
 
-def reconstruct_components(modes: np.ndarray, mode_band: Dict[int, str]) -> Dict[str, np.ndarray]:
-    """Sum modes per band."""
-    n = modes.shape[1]
-    comps: Dict[str, np.ndarray] = {}
-    for band in HRV_BANDS.keys():
-        idx = [i for i, b in mode_band.items() if b == band]
-        comps[band] = np.sum(modes[idx, :], axis=0) if idx else np.zeros(n, dtype=float)
-    return comps
+def get_time_axis(df: pd.DataFrame) -> np.ndarray:
+    """Extract time axis in seconds (0-based) from TIME column."""
+    time_col = find_time_column(df)
+    t = df[time_col].apply(parse_time_to_seconds).to_numpy(dtype=float)
+
+    mask = np.isfinite(t)
+    if not np.any(mask):
+        raise ValueError("No valid TIME values.")
+    t = t[mask]
+    t = t - t[0]  # start at 0
+    return t
 
 
-# ----------------- HRV-aware AVMD ----------------- #
+def clean_hr_series(hr: pd.Series) -> np.ndarray:
+    """Basic HR cleaning, return hr_bpm array."""
+    s = hr.astype(str).str.replace(",", ".", regex=False)
+    h = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
 
-def _coverage_score(mode_band: Dict[int, str], required: Iterable[str]) -> int:
-    present = set(mode_band.values())
-    return sum(1 for b in required if b in present)
+    # Physiologic HR range
+    mask = (h >= 30.0) & (h <= 220.0)
+    h = h[mask]
+    return h
 
 
-def run_avmd_hrv(
-    signal: np.ndarray,
-    fs: float,
-    alpha: float,
-    kmin: int,
-    kmax: int,
-    energy_loss: float,
-    required_bands: Tuple[str, ...],
-    use_omega: bool,
-    dc: int,
-) -> Tuple[np.ndarray, Any, int, Dict[int, str]]:
+def reconstruct_rr_from_hr(time_s: np.ndarray, hr_bpm: np.ndarray) -> pd.Series:
     """
-    HRV-focused AVMD:
-    Select smallest K that satisfies:
-      coverage(required_bands) == all  AND  reconstruction loss <= energy_loss
-    Otherwise select best by (coverage desc, loss asc).
+    Reconstruct RR intervals (seconds) from HR time series.
+
+    Idea:
+      - Instantaneous frequency f(t) = HR(t) / 60  [beats/s]
+      - Cumulative beats N(t) = integral f(t) dt
+      - Beat n occurs when N(t) crosses integer n
+      - RR_k = t_k - t_{k-1}
     """
-    x = np.asarray(signal, dtype=float)
+    t = np.asarray(time_s, dtype=float)
+    h = np.asarray(hr_bpm, dtype=float)
 
-    best = {"K": None, "loss": float("inf"), "cov": -1, "modes": None, "omega": None, "band": None}
+    # joint finite mask
+    mask = np.isfinite(t) & np.isfinite(h)
+    t = t[mask]
+    h = h[mask]
 
-    for K in range(kmin, kmax + 1):
-        modes, omega = run_vmd(x, K=K, alpha=alpha, dc=dc)
-        rec = np.sum(modes, axis=0)
+    if t.size < 2:
+        return pd.Series(dtype=float, name="rr_sec")
 
-        minlen = min(len(x), len(rec))
-        loss = float(np.linalg.norm(x[:minlen] - rec[:minlen]) / np.linalg.norm(x[:minlen]))
+    # Instantaneous frequency in Hz
+    f = h / 60.0
 
-        band = assign_modes_to_bands(modes, fs=fs, omega=omega, use_omega=use_omega)
-        cov = _coverage_score(band, required_bands)
+    # dt between samples
+    dt = np.diff(t)
+    valid_dt = dt > 0
+    if not np.all(valid_dt):
+        t = t[np.concatenate(([True], valid_dt))]
+        f = f[np.concatenate(([True], valid_dt))]
+        dt = np.diff(t)
 
-        print(f"[AVMD-HRV] K={K}, loss={loss:.6f}, coverage={cov}/{len(required_bands)}")
+    if t.size < 2:
+        return pd.Series(dtype=float, name="rr_sec")
 
-        if cov == len(required_bands) and loss <= energy_loss:
-            print(f"[AVMD-HRV] Selected K={K} (meets coverage + loss)")
-            return modes, omega, K, band
+    # cumulative beats via trapezoidal rule
+    beats_seg = 0.5 * (f[:-1] + f[1:]) * dt
+    N = np.concatenate(([0.0], np.cumsum(beats_seg)))
 
-        better = (cov > best["cov"]) or (cov == best["cov"] and loss < best["loss"])
-        if better:
-            best.update({"K": K, "loss": loss, "cov": cov, "modes": modes, "omega": omega, "band": band})
+    total_beats = int(np.floor(N[-1]))
+    if total_beats < 2:
+        return pd.Series(dtype=float, name="rr_sec")
 
-    print(f"[AVMD-HRV] Selected K={best['K']} (best coverage/loss fallback)")
-    return best["modes"], best["omega"], int(best["K"]), best["band"]
+    beat_times = np.empty(total_beats, dtype=float)
+    k = 0
+    for n in range(1, total_beats + 1):
+        while k + 1 < N.size and N[k + 1] < n:
+            k += 1
+        if k + 1 >= N.size:
+            beat_times[n - 1] = t[-1]
+            continue
 
-
-# ----------------- VMDON (offline emülasyon) ----------------- #
-
-def _sliding_component(signal: np.ndarray, fs: float, window_s: float, use_vmd: bool, alpha: float, stride: int) -> np.ndarray:
-    x = np.asarray(signal, dtype=float)
-    N = x.size
-    W = int(round(window_s * fs))
-    if W < 4 or W >= N:
-        raise ValueError(f"Window too short/long: W={W}, N={N}")
-
-    acc = np.zeros(N, dtype=float)
-    cnt = np.zeros(N, dtype=float)
-    t_local = np.arange(W)
-
-    for start in range(0, N - W + 1, stride):
-        w = x[start:start + W]
-        p = np.polyfit(t_local, w, 1)
-        trend = np.polyval(p, t_local)
-        w_detr = w - trend
-
-        if use_vmd:
-            u, _ = run_vmd(w_detr, K=1, alpha=alpha, dc=0)
-            comp_win = u[0]
+        if N[k + 1] == N[k]:
+            tb = t[k + 1]
         else:
-            comp_win = trend
+            frac = (n - N[k]) / (N[k + 1] - N[k])
+            tb = t[k] + frac * (t[k + 1] - t[k])
+        beat_times[n - 1] = tb
 
-        acc[start:start + W] += comp_win
-        cnt[start:start + W] += 1.0
+    rr = np.diff(beat_times)
 
-    out = np.zeros(N, dtype=float)
-    m = cnt > 0
-    out[m] = acc[m] / cnt[m]
-    return out
+    # Physiologic RR filter
+    mask_rr = (rr >= 0.25) & (rr <= 2.0)
+    rr = rr[mask_rr]
 
-
-def vmdon_offline(hrv: np.ndarray, fs: float, stride_hf: int = 1, stride_lf: int = 2, stride_vlf: int = 10, stride_ulf: int = 60) -> Dict[str, np.ndarray]:
-    x = np.asarray(hrv, dtype=float)
-
-    hf = _sliding_component(x, fs, VMDON_WINDOW_S["HF"], True, VMD_ALPHA, stride_hf)
-    r = x - hf
-
-    lf = _sliding_component(r, fs, VMDON_WINDOW_S["LF"], True, VMD_ALPHA, stride_lf)
-    r = r - lf
-
-    vlf = _sliding_component(r, fs, VMDON_WINDOW_S["VLF"], True, VMD_ALPHA, stride_vlf)
-    r = r - vlf
-
-    ulf = _sliding_component(r, fs, VMDON_WINDOW_S["ULF"], False, VMD_ALPHA, stride_ulf)
-
-    return {"HF": hf, "LF": lf, "VLF": vlf, "ULF": ulf}
+    return pd.Series(rr, name="rr_sec").reset_index(drop=True)
 
 
-# ----------------- HILBERT AM/FM ----------------- #
+def main() -> None:
+    print(f"[INFO] Reading {TFM_PATH}")
+    # TFM.csv noktalı virgülle ayrılmış ve ondalık virgül kullanıyor
+    df = pd.read_csv(TFM_PATH, sep=";", engine="python", decimal=",")
 
-def hilbert_am_fm(x: np.ndarray, fs: float, sg_window_s: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
-    x = np.asarray(x, dtype=float)
-    analytic = hilbert(x)
-    amp = np.abs(analytic)
-    phase = np.unwrap(np.angle(analytic))
+    time_s = get_time_axis(df)
 
-    if sg_window_s is None:
-        sg_window_s = 1.0
+    hr_cols = find_hr_columns(df)
+    if not hr_cols:
+        print("[WARN] No HR columns with 'HeartRate' or 'HRM' in name.")
+        return
 
-    win_len = int(round(sg_window_s * fs))
-    if win_len % 2 == 0:
-        win_len += 1
-    win_len = max(win_len, 5)
+    print(f"[INFO] Found {len(hr_cols)} HR columns.")
 
-    amp_s = savgol_filter(amp, win_len, polyorder=2)
-    ph_s = savgol_filter(phase, win_len, polyorder=2)
+    mapping_rows = []
+    subject_idx = 1
 
-    dph = np.gradient(ph_s) * fs
-    freq = dph / (2.0 * np.pi)
-    return amp_s, freq
+    for col in hr_cols:
+        hr_bpm = clean_hr_series(df[col])
+        rr_sec_series = reconstruct_rr_from_hr(time_s, hr_bpm)
 
+        if rr_sec_series.empty:
+            print(f"[WARN] Empty RR after reconstruction for column '{col}'")
+            continue
 
-# ----------------- PLOT & SUMMARY ----------------- #
+        subject_code = f"S{subject_idx:02d}"
+        out_path = OUT_DIR / f"{subject_code}_clean.csv"
+        rr_sec_series.to_csv(out_path, index=False)
 
-def plot_components(t: np.ndarray, hrv: np.ndarray, comps: Dict[str, np.ndarray], subject: str, method: str) -> None:
-    fig, axes = plt.subplots(5, 1, figsize=(14, 8), sharex=True)
+        print(f"[INFO] Saved {out_path.name} (n={len(rr_sec_series)}) from column '{col}'")
 
-    axes[0].plot(t, hrv, linewidth=0.8)
-    axes[0].set_title(f"Subject {subject} - Uniform HRV(t) [{method}]")
-    axes[0].set_ylabel("RR (s)")
-    axes[0].grid(True, alpha=0.3)
-
-    for ax, band in zip(axes[1:], ["HF", "LF", "VLF", "ULF"]):
-        ax.plot(t, comps[band], linewidth=0.8)
-        ax.set_ylabel(band)
-        ax.grid(True, alpha=0.3)
-
-    axes[-1].set_xlabel("Time (s)")
-    plt.tight_layout()
-    plt.show()
-
-
-def print_band_summary(comps: Dict[str, np.ndarray]) -> None:
-    print("\n[SUMMARY] Band powers (variance) & basic stats:")
-    for band, x in comps.items():
-        x = np.asarray(x, dtype=float)
-        mean = float(np.mean(x))
-        var = float(np.var(x))
-        var_demean = float(np.var(x - mean))
-        print(f"  {band}: var={var:.6e}, mean={mean:.4f}, var_demean={var_demean:.6e}")
-
-
-# ----------------- MAIN ----------------- #
-
-def run_for_subject(
-    subject: str,
-    method: Literal["vmd", "avmd", "vmdon"],
-    max_minutes: Optional[float],
-    detrend: Literal["none", "mean", "linear"],
-    kmin: int,
-    kmax: int,
-    energy_loss: float,
-    use_omega: bool,
-    dc: int,
-) -> None:
-    rr = load_rr_sec_from_clean(subject)
-    print(f"[INFO] Loaded {rr.size} RR intervals (sec) for subject={subject}")
-    print(f"[INFO] Approx duration: {rr.sum()/60.0:.1f} minutes")
-
-    t, hrv = rr_to_uniform_hrv(rr, fs=FS_RESAMPLE, max_minutes=max_minutes)
-    print(f"[INFO] Uniform HRV length: {hrv.size} samples ({t[-1]/60.0:.1f} min) at {FS_RESAMPLE} Hz")
-
-    hrv_p = detrend_signal(hrv, mode=detrend)
-
-    if method == "avmd":
-        modes, omega, K, band = run_avmd_hrv(
-            hrv_p, FS_RESAMPLE,
-            alpha=VMD_ALPHA,
-            kmin=kmin, kmax=kmax,
-            energy_loss=energy_loss,
-            required_bands=REQUIRED_BANDS,
-            use_omega=use_omega,
-            dc=dc,
+        mapping_rows.append(
+            {
+                "subject_code": subject_code,
+                "source_column": str(col),
+            }
         )
-        print(f"[INFO] AVMD-HRV modes shape: {modes.shape} (K={K})")
-        comps = reconstruct_components(modes, band)
 
-    elif method == "vmd":
-        K = max(4, kmin)
-        modes, omega = run_vmd(hrv_p, K=K, alpha=VMD_ALPHA, dc=dc)
-        band = assign_modes_to_bands(modes, FS_RESAMPLE, omega=omega, use_omega=use_omega)
-        comps = reconstruct_components(modes, band)
+        subject_idx += 1
 
-    elif method == "vmdon":
-        comps = vmdon_offline(hrv_p, FS_RESAMPLE)
-
+    if mapping_rows:
+        map_df = pd.DataFrame(mapping_rows)
+        map_df.to_csv(MAP_PATH, index=False)
+        print(f"[INFO] Anon mapping saved to {MAP_PATH.name}")
     else:
-        raise ValueError("Unknown method")
-
-    plot_components(t[:comps["HF"].size], hrv_p[:comps["HF"].size], comps, subject, method)
-    print_band_summary(comps)
-
-    print("\n[INFO] Example AM/FM for HF band (first 10 minutes segment).")
-    mask = t <= 10*60.0
-    hf_seg = comps["HF"][mask[:comps["HF"].size]]
-    amp, freq = hilbert_am_fm(hf_seg, FS_RESAMPLE, sg_window_s=2.0)
-    print(f"  HF AM median: {np.median(amp):.4f}, HF FM median: {np.median(freq):.4f} Hz")
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--subject", required=True)
-    p.add_argument("--method", choices=["vmd", "avmd", "vmdon"], default="avmd")
-    p.add_argument("--max-minutes", type=float, default=30.0)
-    p.add_argument("--detrend", choices=["none", "mean", "linear"], default="mean")
-    p.add_argument("--kmin", type=int, default=4)
-    p.add_argument("--kmax", type=int, default=12)
-    p.add_argument("--energy-loss", type=float, default=0.01)
-    p.add_argument("--no-omega", action="store_true")
-    p.add_argument("--dc", type=int, choices=[0, 1], default=0)
-    return p.parse_args()
+        print("[WARN] No subjects generated.")
 
 
 if __name__ == "__main__":
-    a = parse_args()
-    run_for_subject(
-        a.subject,
-        method=a.method,
-        max_minutes=a.max_minutes,
-        detrend=a.detrend,
-        kmin=a.kmin,
-        kmax=a.kmax,
-        energy_loss=a.energy_loss,
-        use_omega=(not a.no_omega),
-        dc=a.dc,
-    )
+    main()
