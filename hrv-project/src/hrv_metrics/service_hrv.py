@@ -1,4 +1,3 @@
-# src/hrv_metrics/service_hrv.py
 """
 HRV service layer.
 
@@ -8,6 +7,7 @@ Sorumluluklar:
     - Time-domain, frequency-domain ve Poincaré temelli HRV metriklerini hesaplamak.
     - Subject listesi ve demografik bilgileri sağlamak.
     - Sinyal kalitesi (teknik) özeti üretmek.
+    - Spark AVMD job'ından gelen band özetlerini sağlamak.
 
 Konfigürasyon:
     - Veri yolları:    settings.paths
@@ -16,30 +16,42 @@ Konfigürasyon:
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from src.utils.logging_utils import get_logger
-from scipy.interpolate import CubicSpline
-from scipy.signal import welch
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
-logger = get_logger(module_name="hrv_service", logfile_name="hrv_service.log")
-from typing import Dict, Any  
-
 from scipy.interpolate import CubicSpline
 from scipy.signal import welch
 
+from src.utils.logging_utils import get_logger
 from src.config.settings import settings
 from src.streaming.rr_buffer import GLOBAL_RR_BUFFER
 from vmdpy import VMD
 
+logger = get_logger(module_name="hrv_service", logfile_name="hrv_service.log")
+
+# -------------------------------------------------------------------
+# KONFİG / SABİTLER
+# -------------------------------------------------------------------
+
 # Canlı mod (True) iken, RR kaynağı sadece GLOBAL_RR_BUFFER'dır.
 # False yapılırsa, RR verisi yoksa CSV fallback devreye girer (offline analiz).
-LIVE_ONLY: bool = True
+LIVE_ONLY: bool = False
 
 # Konfigürasyondan gelen yollar
 PATIENT_INFO_PATH: Path = settings.paths.patient_info_path
 RR_DIR: Path = settings.paths.rr_processed_dir
+
+# Spark AVMD job'ının ürettiği Parquet yolu
+# (settings.paths.avmd_spark_parquet yoksa default'a düş)
+try:
+    AVMD_SPARK_PARQUET: Path = settings.paths.avmd_spark_parquet
+except AttributeError:
+    AVMD_SPARK_PARQUET: Path = Path("data/processed/hrv_bands_avmd.parquet")
+
+# AVMD-Spark Parquet cache
+_AVMD_SPARK_CACHE_DF: Optional[pd.DataFrame] = None
+_AVMD_SPARK_CACHE_MTIME: Optional[float] = None
 
 # VMDON parametreleri (offline script ile uyumlu)
 VMD_ALPHA: float = 2000.0
@@ -54,18 +66,23 @@ VMDON_WINDOW_S: Dict[str, float] = {
     "ULF": 1800.0,
 }
 
-def get_available_subject_codes():
+
+# -------------------------------------------------------------------
+# SUBJECT LİSTESİ
+# -------------------------------------------------------------------
+
+def get_available_subject_codes() -> List[str]:
     """
     rr_clean klasöründeki *_clean.csv dosyalarından subject_code listesini üretir.
     Örn: 000_clean.csv -> '000'
     """
-    codes = []
+    codes: List[str] = []
     for path in RR_DIR.glob("*_clean.csv"):
         code = path.stem.replace("_clean", "")
         codes.append(code)
 
     # sayısal sıraya göre sırala (000,002,003,005,401,...)
-    def _sort_key(c):
+    def _sort_key(c: str) -> int:
         try:
             return int(c)
         except ValueError:
@@ -79,8 +96,9 @@ def get_available_subject_codes():
     return codes
 
 
-
-# -------------------- RR KAYNAĞI -------------------- #
+# -------------------------------------------------------------------
+# RR KAYNAĞI (LIVE + CSV FALLBACK)
+# -------------------------------------------------------------------
 
 def load_rr(subject_code: str, window_length_s: Optional[float] = None) -> np.ndarray:
     """
@@ -99,9 +117,6 @@ def load_rr(subject_code: str, window_length_s: Optional[float] = None) -> np.nd
                 Tam buffer veya tam kayıt kullanılır.
             Eğer > 0 ise:
                 Sadece son window_length_s saniyeye düşen RR intervalleri alınır.
-
-    Returns:
-        1D numpy array (float64), saniye cinsinden RR intervalleri.
     """
     rr_live = GLOBAL_RR_BUFFER.get_rr_sec(subject_code, window_s=window_length_s)
     if rr_live and len(rr_live) >= 2:
@@ -129,10 +144,9 @@ def load_rr_from_csv(subject_code: str) -> np.ndarray:
 
     df = pd.read_csv(csv_path)
 
-    # BURADA BİR VARSAYIM YAPIYORUM:
-    #   - Eğer kolon adı 'rr' ise direkt alıyoruz
-    #   - Eğer 'rr_ms' ise saniyeye çeviriyoruz (ms / 1000)
-    # Eğer sende farklı isimse (örneğin 'RR_interval_ms') sadece aşağıdaki kısmı değiştirmen yeter.
+    # Kolon adı varsayımları:
+    #   - 'rr' ise saniye
+    #   - 'rr_ms' ise milisaniye (ms -> s)
     if "rr" in df.columns:
         rr_sec = df["rr"].to_numpy(dtype=float)
     elif "rr_ms" in df.columns:
@@ -153,8 +167,36 @@ def load_rr_from_csv(subject_code: str) -> np.ndarray:
     return rr_sec
 
 
+def _apply_time_window(rr: np.ndarray, window_length_s: Optional[float]) -> np.ndarray:
+    """
+    RR serisini (saniye cinsinden) verilen pencere süresine göre kırpar.
 
-# -------------------- TIME-DOMAIN HESAP -------------------- #
+    - window_length_s None ise:
+        Tüm kayıt kullanılır.
+    - window_length_s > 0 ise:
+        Sadece SON window_length_s saniyeyi kapsayan RR intervalleri döner.
+    """
+    rr = np.asarray(rr, dtype=float)
+    if rr.size == 0:
+        return rr
+    if window_length_s is None or window_length_s <= 0:
+        return rr
+
+    t_cum = np.cumsum(rr)  # kümülatif zaman (s)
+    total_duration = float(t_cum[-1])
+
+    # Kayıt zaten window_length_s'ten kısaysa -> dokunma
+    if total_duration <= window_length_s:
+        return rr
+
+    start_time = total_duration - window_length_s
+    mask = t_cum >= start_time
+    return rr[mask]
+
+
+# -------------------------------------------------------------------
+# TIME-DOMAIN HESAP
+# -------------------------------------------------------------------
 
 def _compute_time_domain_from_rr(rr: np.ndarray) -> Dict[str, float]:
     """
@@ -163,13 +205,6 @@ def _compute_time_domain_from_rr(rr: np.ndarray) -> Dict[str, float]:
     Girdi:
         rr:
             Saniye cinsinden RR intervalleri (ör: 0.8 = 800 ms)
-
-    Dönen değerler (ms veya bpm):
-        - sdnn, sdrr, rmssd
-        - nn50, pnn50
-        - mean_hr, hr_max, hr_min, hr_range
-        - hti, tinn (histogram tabanlı metrikler)
-        - n_beats, duration_s
     """
     rr = np.asarray(rr, dtype=float)
 
@@ -219,8 +254,8 @@ def _compute_time_domain_from_rr(rr: np.ndarray) -> Dict[str, float]:
     max_rr = float(np.max(rr))
 
     mean_hr = float(60.0 / mean_rr) if mean_rr > 0 else float("nan")
-    hr_max = float(60.0 / min_rr) if min_rr > 0 else float("nan")  # en kısa RR -> en yüksek HR
-    hr_min = float(60.0 / max_rr) if max_rr > 0 else float("nan")  # en uzun RR -> en düşük HR
+    hr_max = float(60.0 / min_rr) if min_rr > 0 else float("nan")  # kısa RR -> yüksek HR
+    hr_min = float(60.0 / max_rr) if max_rr > 0 else float("nan")  # uzun RR -> düşük HR
     hr_range = (
         float(hr_max - hr_min)
         if np.isfinite(hr_max) and np.isfinite(hr_min)
@@ -273,38 +308,22 @@ def _compute_time_domain_from_rr(rr: np.ndarray) -> Dict[str, float]:
     }
 
 
-def _apply_time_window(rr: np.ndarray, window_length_s: Optional[float]) -> np.ndarray:
+def get_time_domain_metrics(
+    subject_code: str = "000",
+    window_length_s: Optional[float] = None,
+) -> Dict[str, float]:
     """
-    RR serisini (saniye cinsinden) verilen pencere süresine göre kırpar.
-
-    - window_length_s None ise:
-        Tüm kayıt kullanılır.
-    - window_length_s > 0 ise:
-        Sadece SON window_length_s saniyeyi kapsayan RR intervalleri döner.
-
-    Örnek:
-        total_duration = 1200 s ve window_length_s = 300 s ise,
-        son 300 saniyeye düşen RR'ler alınır.
+    Time-domain HRV metriklerini döner (sdnn, rmssd, pnn50, hr_min, hr_max, ...).
     """
-    rr = np.asarray(rr, dtype=float)
-    if rr.size == 0:
-        return rr
-    if window_length_s is None or window_length_s <= 0:
-        return rr
-
-    t_cum = np.cumsum(rr)  # kümülatif zaman (s)
-    total_duration = float(t_cum[-1])
-
-    # Kayıt zaten window_length_s'ten kısaysa -> dokunma
-    if total_duration <= window_length_s:
-        return rr
-
-    start_time = total_duration - window_length_s
-    mask = t_cum >= start_time
-    return rr[mask]
+    rr = load_rr(subject_code, window_length_s=window_length_s)
+    td = _compute_time_domain_from_rr(rr)
+    td["window_length_s"] = window_length_s
+    return td
 
 
-# -------------------- FREQUENCY-DOMAIN HESAP -------------------- #
+# -------------------------------------------------------------------
+# FREQUENCY-DOMAIN HESAP
+# -------------------------------------------------------------------
 
 def _compute_freq_domain_from_rr(
     rr: np.ndarray,
@@ -353,7 +372,7 @@ def _compute_freq_domain_from_rr(
             "lf_hf_ratio": float("nan"),
         }
 
-    # RR(t) sinyalini yeniden örnekle (cubic spline ile, olmazsa lineer)
+    # RR(t) sinyalini yeniden örnekle (cubic spline, olmazsa lineer)
     try:
         cs = CubicSpline(t, rr, bc_type="natural")
         rr_interp = cs(t_uniform)
@@ -393,6 +412,38 @@ def _compute_freq_domain_from_rr(
         "lf_hf_ratio": lf_hf_ratio,
     }
 
+
+def get_freq_domain_metrics(
+    subject_code: str,
+    window_length_s: Optional[float] = None,
+    fs_resample: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Verilen subject için frekans-domeni HRV metriklerini döner.
+    """
+    if fs_resample is None:
+        fs_resample = settings.hrv.fs_resample
+
+    vlf_band = settings.hrv.vlf_band
+    lf_band = settings.hrv.lf_band
+    hf_band = settings.hrv.hf_band
+
+    rr = load_rr(subject_code, window_length_s=window_length_s)
+    fd = _compute_freq_domain_from_rr(
+        rr,
+        fs_resample=fs_resample,
+        vlf_band=vlf_band,
+        lf_band=lf_band,
+        hf_band=hf_band,
+    )
+    fd["window_length_s"] = window_length_s
+    return fd
+
+
+# -------------------------------------------------------------------
+# RR -> UNIFORM HRV(t) (VMDON / AVMD için)
+# -------------------------------------------------------------------
+
 def _rr_to_uniform_hrv(
     rr: np.ndarray,
     fs: float,
@@ -420,6 +471,10 @@ def _rr_to_uniform_hrv(
 
     return t_uniform, hrv
 
+
+# -------------------------------------------------------------------
+# VMDON BİLEŞENLERİ
+# -------------------------------------------------------------------
 
 def _run_vmd_1mode(signal: np.ndarray, alpha: float) -> np.ndarray:
     """Run single-mode VMD and return the decomposed component."""
@@ -535,39 +590,6 @@ def _vmdon_decompose(
     return {"HF": hf, "LF": lf, "VLF": vlf, "ULF": ulf}
 
 
-def get_freq_domain_metrics(
-    subject_code: str,
-    window_length_s: Optional[float] = None,
-    fs_resample: Optional[float] = None,
-) -> Dict[str, object]:
-    """
-    Verilen subject için frekans-domeni HRV metriklerini döner.
-
-    Parametreler:
-        window_length_s:
-            None -> tüm buffer/kayıt
-            >0  -> son window_length_s saniye
-        fs_resample:
-            Yeniden örnekleme frekansı (Hz). None ise settings.hrv.fs_resample kullanılır.
-    """
-    if fs_resample is None:
-        fs_resample = settings.hrv.fs_resample
-
-    vlf_band = settings.hrv.vlf_band
-    lf_band = settings.hrv.lf_band
-    hf_band = settings.hrv.hf_band
-
-    rr = load_rr(subject_code, window_length_s=window_length_s)
-    fd = _compute_freq_domain_from_rr(
-        rr,
-        fs_resample=fs_resample,
-        vlf_band=vlf_band,
-        lf_band=lf_band,
-        hf_band=hf_band,
-    )
-    fd["window_length_s"] = window_length_s
-    return fd
-
 def get_vmdon_components(
     subject_code: str,
     window_length_s: Optional[float] = None,
@@ -614,7 +636,10 @@ def get_vmdon_components(
         "window_length_s": window_length_s,
     }
 
-# -------------------- HR TIME-SERIES -------------------- #
+
+# -------------------------------------------------------------------
+# HR ZAMAN SERİSİ
+# -------------------------------------------------------------------
 
 def get_hr_timeseries(
     subject_code: str,
@@ -627,8 +652,6 @@ def get_hr_timeseries(
     Dönüş:
         t_sec  : kümülatif zaman (saniye)
         hr_bpm : kalp hızı (bpm)
-
-    max_points None ise, settings.dashboard.max_hr_points kullanılır.
     """
     rr = load_rr(subject_code, window_length_s=window_length_s)
 
@@ -648,18 +671,9 @@ def get_hr_timeseries(
     return t_sec, hr_bpm
 
 
-def get_time_domain_metrics(
-    subject_code: str = "000",
-    window_length_s: Optional[float] = None,
-) -> Dict[str, float]:
-    """
-    Time-domain HRV metriklerini döner (sdnn, rmssd, pnn50, hr_min, hr_max, ...).
-    """
-    rr = load_rr(subject_code, window_length_s=window_length_s)
-    td = _compute_time_domain_from_rr(rr)
-    td["window_length_s"] = window_length_s
-    return td
-
+# -------------------------------------------------------------------
+# POINCARÉ / NON-LINEAR
+# -------------------------------------------------------------------
 
 def get_poincare_data(
     subject_code: str,
@@ -668,16 +682,6 @@ def get_poincare_data(
 ) -> Dict[str, object]:
     """
     Poincaré plot verisini ve non-linear metrikleri döner.
-
-    Dönüş:
-        x, y:
-            RRₙ ve RRₙ₊₁ (ms cinsinden), scatter plot için
-        sd1, sd2:
-            Kısa ve uzun eksen standart sapmaları
-        sd1_sd2_ratio:
-            SD1 / SD2 oranı
-        stress_index:
-            SD2 / SD1 oranına dayalı basit bir stres indeksi
     """
     rr = load_rr(subject_code, window_length_s=window_length_s)
 
@@ -723,16 +727,13 @@ def get_poincare_data(
     }
 
 
-from typing import Dict, Any  # dosyanın üstünde varsa tekrar ekleme
+# -------------------------------------------------------------------
+# DEMOGRAFİK / SUBJECT INFO
+# -------------------------------------------------------------------
 
 def get_subject_info(subject_code: str) -> Dict[str, Any]:
     """
     Demografik bilgiler: age / sex / group (child/adult/older).
-
-    CSV formatını esnek okur:
-    - İlk satır "code;age;sex" veya "File;age;sex" olabilir (header).
-    - Ya da hiç header olmayıp direkt "0;53;M" ile başlayabilir.
-    - İlk kolon bazen "File" bazen "code" olabilir.
     """
     try:
         df = pd.read_csv(
@@ -795,25 +796,24 @@ def get_subject_info(subject_code: str) -> Dict[str, Any]:
         age_val = None
 
     if age_val is None:
-        group = None
+        group: Optional[str] = None
     elif age_val < 18:
         group = "Child / adolescent"
     elif age_val < 65:
         group = "Adult"
-        # buradaki eşikler istersen settings.hrv içinde parametrelenebilir
     else:
         group = "Older adult"
 
     return {"code": subject_code, "age": age, "sex": sex, "group": group}
 
 
+# -------------------------------------------------------------------
+# SİNYAL KALİTESİ
+# -------------------------------------------------------------------
 
 def _compute_signal_quality(rr: np.ndarray) -> Dict[str, object]:
     """
     RR serisinden basit bir sinyal kalite özeti üretir.
-
-    Not:
-        Bu sadece teknik bir kalite değerlendirmesidir, klinik/medikal yorum değildir.
     """
     rr = np.asarray(rr, dtype=float)
     n_total = rr.size
@@ -874,4 +874,210 @@ def get_signal_status(subject_code: str, window_length_s: Optional[float] = None
     rr = load_rr(subject_code, window_length_s=window_length_s)
     return _compute_signal_quality(rr)
 
+
+# -------------------------------------------------------------------
+# SPARK AVMD PARQUET OKUMA + BAND ÖZETLERİ
+# -------------------------------------------------------------------
+
+def _load_avmd_spark_table(reload_if_changed: bool = True) -> pd.DataFrame:
+    """
+    Spark AVMD job'ının ürettiği Parquet dosyasını okur.
+    Basit bir mtime cache ile gereksiz tekrar okumayı engeller.
+    """
+    global _AVMD_SPARK_CACHE_DF, _AVMD_SPARK_CACHE_MTIME
+
+    path = AVMD_SPARK_PARQUET
+
+    if not path.exists():
+        logger.warning(
+            "AVMD Spark parquet not found at %s. Run hrv_vmd_spark.py first.",
+            path,
+        )
+        return pd.DataFrame()
+
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+
+    # Cache varsa ve dosya değişmemişse, onu kullan
+    if (
+        _AVMD_SPARK_CACHE_DF is not None
+        and _AVMD_SPARK_CACHE_MTIME is not None
+        and mtime is not None
+        and abs(_AVMD_SPARK_CACHE_MTIME - mtime) < 1e-6
+    ):
+        return _AVMD_SPARK_CACHE_DF
+
+    try:
+        df = pd.read_parquet(path)
+    except Exception as e:
+        logger.error("Failed to read AVMD Spark parquet %s: %s", path, e)
+        return pd.DataFrame()
+
+    _AVMD_SPARK_CACHE_DF = df
+    _AVMD_SPARK_CACHE_MTIME = mtime
+    return df
+
+
+def get_avmd_spark_bands(subject_code: str) -> Dict[str, Any]:
+    """
+    Spark AVMD job'ının (hrv_vmd_spark.py) ürettiği band özetlerini döner.
+
+    Beklenen Parquet kolon isimleri (gerçek kolonlara göre uyarlayabilirsin):
+        - subject / code / subject_code : subject kimliği
+        - band or band_name             : 'ULF', 'VLF', 'LF', 'HF', '?'
+        - power or power_abs            : band gücü (mutlak)
+        - power_rel (opsiyonel)         : toplam güce göre normalize güç
+        - lf_hf_ratio (opsiyonel)       : LF/HF oranı (eğer satırda varsa)
+
+    Dönüş:
+        {
+            "subject": "000",
+            "bands": [
+                {"band": "ULF", "power": 0.123, "power_rel": 12.3},
+                {"band": "VLF", "power": 0.456, "power_rel": 45.6},
+                ...
+            ],
+            "lf_hf_ratio": 1.23,
+        }
+    """
+    df = _load_avmd_spark_table()
+    if df.empty:
+        return {
+            "subject": subject_code,
+            "bands": [],
+            "lf_hf_ratio": float("nan"),
+        }
+
+    # ---- subject kolonu tespit et ----
+    subject_col = None
+    for c in ("subject", "code", "subject_code"):
+        if c in df.columns:
+            subject_col = c
+            break
+
+    if subject_col is None:
+        logger.error(
+            "AVMD Spark parquet does not contain a subject column. Columns=%s",
+            list(df.columns),
+        )
+        return {
+            "subject": subject_code,
+            "bands": [],
+            "lf_hf_ratio": float("nan"),
+        }
+
+    # ---- band kolonu tespit et ----
+    band_col = None
+    for c in ("band", "band_name", "component"):
+        if c in df.columns:
+            band_col = c
+            break
+
+    if band_col is None:
+        logger.error(
+            "AVMD Spark parquet does not contain a band column. Columns=%s",
+            list(df.columns),
+        )
+        return {
+            "subject": subject_code,
+            "bands": [],
+            "lf_hf_ratio": float("nan"),
+        }
+
+    # ---- güç kolonu tespit et ----
+    power_col = None
+    for c in ("power", "power_abs", "band_power", "pwr"):
+        if c in df.columns:
+            power_col = c
+            break
+
+    if power_col is None:
+        logger.error(
+            "AVMD Spark parquet does not contain a power column. Columns=%s",
+            list(df.columns),
+        )
+        return {
+            "subject": subject_code,
+            "bands": [],
+            "lf_hf_ratio": float("nan"),
+        }
+
+    # opsiyonel: relatif güç kolonu
+    power_rel_col = None
+    for c in ("power_rel", "rel_power", "rel"):
+        if c in df.columns:
+            power_rel_col = c
+            break
+
+    # ---- ilgili subject'i filtrele ----
+    df["__subj_str__"] = df[subject_col].astype(str)
+    subj_str = str(subject_code)
+    df_subj = df[df["__subj_str__"] == subj_str]
+
+    if df_subj.empty:
+        logger.warning(
+            "No AVMD Spark rows found for subject=%s in parquet=%s",
+            subject_code,
+            AVMD_SPARK_PARQUET,
+        )
+        return {
+            "subject": subject_code,
+            "bands": [],
+            "lf_hf_ratio": float("nan"),
+        }
+
+    # Eğer birden fazla pencere/segment varsa, aynı band için ortalama al
+    bands_out: List[Dict[str, Any]] = []
+    lf_power = None
+    hf_power = None
+
+    # Klasik HRV bantları (ULF opsiyonel)
+    for band_name in ("ULF", "VLF", "LF", "HF"):
+        df_band = df_subj[df_subj[band_col] == band_name]
+        if df_band.empty:
+            continue
+
+        p_abs = float(df_band[power_col].mean())
+
+        if power_rel_col is not None:
+            p_rel = float(df_band[power_rel_col].mean())
+        else:
+            p_rel = float("nan")
+
+        bands_out.append(
+            {
+                "band": band_name,
+                "power": p_abs,
+                "power_rel": p_rel,
+            }
+        )
+
+        if band_name == "LF":
+            lf_power = p_abs
+        elif band_name == "HF":
+            hf_power = p_abs
+
+    # LF/HF oranı – parquet'te hazır yoksa buradan hesapla
+    lf_hf_ratio = float("nan")
+    if lf_power is not None and hf_power is not None and hf_power > 0:
+        lf_hf_ratio = float(lf_power / hf_power)
+
+    # Eğer parquet'te direkt lf_hf_ratio kolonu varsa, onu da fallback olarak al
+    if np.isnan(lf_hf_ratio):
+        for c in ("lf_hf_ratio", "LF_HF", "lfhf"):
+            if c in df_subj.columns:
+                try:
+                    val = float(df_subj[c].iloc[-1])
+                    lf_hf_ratio = val
+                except Exception:
+                    pass
+                break
+
+    return {
+        "subject": subject_code,
+        "bands": bands_out,
+        "lf_hf_ratio": lf_hf_ratio,
+    }
 

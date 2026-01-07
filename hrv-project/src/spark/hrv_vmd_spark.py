@@ -60,6 +60,14 @@ from typing import Sequence
 
 # ... mevcut importlar burada ...
 
+# AVMD parametreleri (offline script ile birebir aynı)
+AVMD_MAX_MINUTES = 30          # --max-minutes
+AVMD_DETREND = "mean"          # --detrend
+AVMD_KMIN = 4                  # --kmin
+AVMD_KMAX = 12                 # --kmax
+AVMD_ENERGY_LOSS = 0.05        # --energy-loss
+
+
 def reconstruct_components(modes: np.ndarray, band) -> np.ndarray:
     """
     Seçili modları toplayarak o banda ait yeniden oluşturulmuş zaman serisini döndürür.
@@ -167,32 +175,49 @@ def _process_one_file(
     frekans bandı özetlerini döndürür.
     Bu fonksiyon Spark worker içinde (RDD map) çalışır.
     """
+
     csv_path = Path(path_str)
     subject = csv_path.stem.replace("_clean", "")
 
-    # 1) RR yükle
+    # ---------------- 1) RR yükle ----------------
     rr_sec = _load_rr_sec_from_csv(csv_path)
     if rr_sec.size == 0:
         return []
 
-    # 2) RR -> uniform HRV(t)
-    t, hrv = rr_to_uniform_hrv(rr_sec, fs=FS_RESAMPLE, max_minutes=max_minutes)
+    # ---------------- 2) RR -> uniform HRV(t) ----------------
+    # AVMD için max_minutes parametresini offline script ile senkronla
+    if method == "avmd":
+        if max_minutes is None or max_minutes <= 0:
+            eff_max_minutes = AVMD_MAX_MINUTES
+        else:
+            # Dışarıdan daha büyük bir değer gelse bile 30 dk ile sınırla
+            eff_max_minutes = min(max_minutes, AVMD_MAX_MINUTES)
+    else:
+        # vmdon vb. için dışarıdan gelen değeri aynen kullan
+        eff_max_minutes = max_minutes
+
+    t, hrv = rr_to_uniform_hrv(rr_sec, fs=FS_RESAMPLE, max_minutes=eff_max_minutes)
     if hrv.size == 0:
         return []
 
-    # 3) Detrend (offline pipeline ile aynı ayar)
-    hrv_p = detrend_signal(hrv, mode="mean")
+    # ---------------- 3) Detrend ----------------
+    # Offline AVMD pipeline ile bire bir aynı: mean detrend
+    if method == "avmd":
+        hrv_p = detrend_signal(hrv, mode=AVMD_DETREND_MODE)
+    else:
+        # İstersen burada da mean kullanabilirsin; şu an aynısını uyguluyorum
+        hrv_p = detrend_signal(hrv, mode="mean")
 
-    # 4) Bileşen ayırma
+    # ---------------- 4) Bileşen ayırma ----------------
     if method == "avmd":
         # HRV-aware AVMD: K seçimi + band assignment
         modes, omega, K, band = run_avmd_hrv(
             hrv_p,
             FS_RESAMPLE,
             alpha=VMD_ALPHA,
-            kmin=4,
-            kmax=12,
-            energy_loss=0.01,
+            kmin=AVMD_KMIN,
+            kmax=AVMD_KMAX,
+            energy_loss=AVMD_ENERGY_LOSS,
             required_bands=REQUIRED_BANDS,
             use_omega=True,
             dc=0,
@@ -206,14 +231,13 @@ def _process_one_file(
     else:
         raise ValueError(f"Unknown method: {method}")
 
-    # --- BURADAN SONRASI: GÜVENLİ NORMALİZASYON & UZUNLUK EŞLEME ---
-
+    # ---------------- 5) Güvenli normalizasyon & uzunluk eşleme ----------------
     import numpy as np
 
     # comps mutlaka dict olsun (band -> np.ndarray)
     if not isinstance(comps, dict):
-        # Eğer tek bir array geldiyse, bunu HF gibi düşün ve sar
         if isinstance(comps, np.ndarray):
+            # Tek array geldiyse HF gibi düşün
             comps = {"HF": comps}
         elif isinstance(comps, (list, tuple)):
             # Liste/tuple ise mode_0, mode_1 ... diye sar
@@ -232,7 +256,7 @@ def _process_one_file(
     t_aligned = t[:n]
     comps_aligned = {k: np.asarray(v)[:n] for k, v in comps.items() if v is not None}
 
-    # 5) Band özetlerini çıkar
+    # ---------------- 6) Band özetlerini çıkar ----------------
     rows = _compute_band_summaries(subject, method, t_aligned, comps_aligned)
     return rows
 

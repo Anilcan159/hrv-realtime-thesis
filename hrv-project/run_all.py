@@ -1,5 +1,16 @@
 # run_all.py
-# Runs FastAPI HRV service + producer (optional) + Dash app in one command
+# Runs:
+#   1) (Opsiyonel) Spark AVMD job -> hrv_bands_avmd.parquet
+#   2) FastAPI HRV service
+#   3) Dash dashboard
+#   4) (Opsiyonel) Kafka producer
+#
+# Tek komut:
+#   python run_all.py
+#
+# Ortam değişkenleri:
+#   START_PRODUCER=0/1   -> Kafka producer başlasın mı? (default: 1)
+#   RUN_SPARK=0/1        -> Spark AVMD job çalışsın mı? (default: 1)
 
 import os
 import sys
@@ -17,6 +28,10 @@ PY = sys.executable
 
 # Kafka ayarları config'ten
 KAFKA_BOOTSTRAP = settings.kafka.bootstrap_servers  # örn: "localhost:9092" veya "kafka:9092"
+
+# Spark AVMD job ayarları
+SPARK_SCRIPT = ROOT / "src" / "spark" / "hrv_vmd_spark.py"
+SPARK_OUTPUT = settings.paths.hrv_bands_avmd_path  # data/processed/hrv_bands_avmd.parquet
 
 
 def _popen(cmd: List[str], name: str) -> subprocess.Popen:
@@ -74,9 +89,46 @@ def _wait_for_kafka(
     return False
 
 
+def _run_spark_avmd_job() -> None:
+    """
+    Spark AVMD job'unu bir kez çalıştırır.
+    Çıkış:
+        data/processed/hrv_bands_avmd.parquet (settings.paths.hrv_bands_avmd_path)
+    """
+    if not SPARK_SCRIPT.exists():
+        print(f"[run_all] Spark script not found: {SPARK_SCRIPT}")
+        return
+
+    # İstersen burada "output zaten var, tekrar çalıştırmayayım" kontrolü koyabilirsin:
+    # if SPARK_OUTPUT.exists():
+    #     print(f"[run_all] Spark output already exists: {SPARK_OUTPUT}, skipping.")
+    #     return
+
+    cmd = [
+        PY,
+        str(SPARK_SCRIPT),
+        "--method",
+        "avmd",
+        "--max-minutes",
+        "30",
+        "--output",
+        str(SPARK_OUTPUT),
+    ]
+
+    print(f"[run_all] running Spark AVMD job:\n  {' '.join(cmd)}")
+    # Spark job kısa süreli bir batch job; blocking çalıştırmak mantıklı
+    result = subprocess.run(cmd, cwd=str(ROOT))
+    if result.returncode != 0:
+        print(f"[run_all] Spark AVMD job FAILED (return code={result.returncode}).")
+    else:
+        print(f"[run_all] Spark AVMD job FINISHED. Output: {SPARK_OUTPUT}")
+
+
 def main() -> None:
     # ---- CONFIG ----
     start_producer = os.environ.get("START_PRODUCER", "1") == "1"
+    run_spark = os.environ.get("RUN_SPARK", "1") == "1"
+
     dash_module = os.environ.get("DASH_APP", "src/dashboard/app.py")
     producer_module = os.environ.get("PRODUCER_APP", "src/streaming/rr_producer.py")
 
@@ -100,6 +152,12 @@ def main() -> None:
     producer_cmd = [PY, str(ROOT / producer_module)]
 
     try:
+        # 0) (Opsiyonel) Spark AVMD batch job
+        if run_spark:
+            _run_spark_avmd_job()
+        else:
+            print("[run_all] RUN_SPARK=0, Spark AVMD job skipped.")
+
         # 1) FastAPI HRV servisini başlat (rr_consumer burada startup'ta açılıyor)
         api_proc = _popen(api_cmd, "api")
         procs.append(("api", api_proc))
@@ -116,6 +174,8 @@ def main() -> None:
             _wait_for_kafka(host=kafka_host, port=kafka_port, timeout_s=30.0)
             producer_proc = _popen(producer_cmd, "producer")
             procs.append(("producer", producer_proc))
+        else:
+            print("[run_all] START_PRODUCER=0, Kafka producer skipped.")
 
         print("\n[run_all] running. stop with CTRL+C\n")
 

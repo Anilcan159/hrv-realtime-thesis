@@ -4,6 +4,8 @@ import sys
 from typing import Any, Dict
 
 import numpy as np
+import pandas as pd                     # <<< YENİ
+from pathlib import Path               # <<< YENİ
 import requests
 from dash import Dash, html, dcc, Input, Output
 import plotly.graph_objects as go
@@ -25,7 +27,24 @@ from src.hrv_metrics.service_hrv import (
     get_signal_status,
     get_vmdon_components,
 )
-from src.streaming.rr_consumer import start_consumer_background
+
+
+# ----------------- SPARK AVMD ÇIKTISI ----------------- #
+
+SPARK_PARQUET_PATH = (
+    Path(PROJECT_ROOT) / "data" / "processed" / "hrv_bands_avmd.parquet"
+)
+
+try:
+    if SPARK_PARQUET_PATH.exists():
+        df_avmd_spark = pd.read_parquet(SPARK_PARQUET_PATH)
+        print(f"[dashboard] Loaded Spark AVMD parquet: {SPARK_PARQUET_PATH}")
+    else:
+        print(f"[dashboard] Spark parquet not found: {SPARK_PARQUET_PATH}")
+        df_avmd_spark = pd.DataFrame()
+except Exception as e:
+    print(f"[dashboard] Failed to load Spark parquet: {e}")
+    df_avmd_spark = pd.DataFrame()
 
 
 # ----------------- RENK PALETİ (PASTEL) ----------------- #
@@ -92,17 +111,7 @@ def _fetch_from_api(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
-DEFAULT_WINDOW_S = settings.dashboard.default_window_s
-
-
-def _window_to_seconds(window_value: str | None) -> float | None:
-    """
-    'full' -> None (tüm kayıt),
-    'last_5min' -> DEFAULT_WINDOW_S
-    """
-    if window_value == "last_5min":
-        return float(DEFAULT_WINDOW_S)
-    return None
+DEFAULT_WINDOW_S = settings.dashboard.default_window_s  # 5 dakikalık pencere
 
 
 def _fmt(v: Any, nd: int = 1) -> str:
@@ -159,6 +168,31 @@ def metric_card(title: str, value: str, unit: str = "") -> html.Div:
             ),
         ],
     )
+
+
+def _empty_figure(title: str, message: str) -> go.Figure:
+    """Boş durumlar için sade bir figure."""
+    fig = go.Figure()
+    fig.update_layout(
+        title=title,
+        annotations=[
+            dict(
+                text=message,
+                x=0.5,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font=dict(color=PALETTE["muted"]),
+            )
+        ],
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        margin=dict(l=40, r=20, t=40, b=40),
+    )
+    return fig
 
 
 # ----------------- DASH APP & LAYOUT ----------------- #
@@ -226,7 +260,7 @@ app.layout = html.Div(
                     ],
                 ),
 
-                # SAĞ: Subject figürü + dropdown card
+                # SAĞ: Subject figürü + dropdown / method card
                 html.Div(
                     style={
                         "display": "flex",
@@ -245,10 +279,10 @@ app.layout = html.Div(
                             },
                         ),
 
-                        # Sağ: dropdown kartı
+                        # Sağ: subject + method kartı
                         html.Div(
                             style={
-                                "minWidth": "340px",
+                                "minWidth": "360px",
                                 "backgroundColor": PALETTE["card"],
                                 "borderRadius": "18px",
                                 "padding": "12px 14px",
@@ -260,7 +294,7 @@ app.layout = html.Div(
                             },
                             children=[
                                 html.Span(
-                                    "Recording selection",
+                                    "Recording & decomposition",
                                     style={
                                         "fontSize": "11px",
                                         "letterSpacing": "0.12em",
@@ -296,7 +330,9 @@ app.layout = html.Div(
                                                         }
                                                         for code in subject_codes
                                                     ],
-                                                    value=subject_codes[0] if subject_codes else None,
+                                                    value=subject_codes[0]
+                                                    if subject_codes
+                                                    else None,
                                                     clearable=False,
                                                     style={
                                                         "color": "#111111",
@@ -306,29 +342,40 @@ app.layout = html.Div(
                                                 ),
                                             ]
                                         ),
-                                        # Window dropdown
+                                        # Method seçimi (VMDON / AVMD Spark)
                                         html.Div(
                                             children=[
                                                 html.Label(
-                                                    "Analysis window",
+                                                    "Decomposition method",
                                                     style={
                                                         "fontSize": "12px",
                                                         "marginBottom": "4px",
                                                         "color": PALETTE["muted"],
                                                     },
                                                 ),
-                                                dcc.Dropdown(
-                                                    id="window-dropdown",
+                                                dcc.RadioItems(
+                                                    id="method-radio",
                                                     options=[
-                                                        {"label": "Full recording", "value": "full"},
-                                                        {"label": "Last 5 minutes", "value": "last_5min"},
+                                                        {
+                                                            "label": "VMDON (online)",
+                                                            "value": "vmdon",
+                                                        },
+                                                        {
+                                                            "label": "AVMD Spark (offline)",
+                                                            "value": "avmd_spark",
+                                                        },
                                                     ],
-                                                    value="last_5min",
-                                                    clearable=False,
-                                                    style={
-                                                        "color": "#111111",
-                                                        "backgroundColor": "#FFFFFF",
-                                                        "fontSize": "13px",
+                                                    value="vmdon",
+                                                    inline=True,
+                                                    labelStyle={
+                                                        "marginRight": "10px",
+                                                        "display": "inline-flex",
+                                                        "alignItems": "center",
+                                                        "gap": "4px",
+                                                        "fontSize": "12px",
+                                                    },
+                                                    inputStyle={
+                                                        "marginRight": "4px",
                                                     },
                                                 ),
                                             ]
@@ -420,27 +467,25 @@ app.layout = html.Div(
                     ],
                 ),
 
-                # VMDON PANEL (ortadaki panel, sadece VMDON)
+                # ORTA PANEL: VMDON veya AVMD SPARK
                 html.Div(
                     style=PANEL_STYLE,
                     children=[
                         html.H3(
-                            "VMDON components & band power",
+                            "Frequency decomposition & band power",
                             style={"marginBottom": "2px", "fontSize": "16px"},
                         ),
                         html.Span(
-                            "Adaptive HRV decomposition into HF / LF / VLF / ULF (VMDON)",
+                            "Online VMDON vs. offline PySpark AVMD",
                             style={"fontSize": "12px", "color": PALETTE["muted"]},
                         ),
 
-                        # Üstte: VMDON bileşenleri (zaman serisi)
                         dcc.Graph(
                             id="vmdon-components-graph",
                             style={"height": "260px", "marginTop": "10px"},
                             config={"displayModeBar": False},
                         ),
 
-                        # Altta: VMDON band power dağılımı (pie)
                         dcc.Graph(
                             id="band-pie-graph",
                             style={"height": "230px", "marginTop": "6px"},
@@ -526,15 +571,13 @@ app.layout = html.Div(
     Output("metrics-grid", "children"),
     Input("refresh", "n_intervals"),
     Input("subject-dropdown", "value"),
-    Input("window-dropdown", "value"),
+    Input("method-radio", "value"),  # method input, şimdilik sadece tetiklemek için
 )
-def update_metrics_grid(n, subject_code, window_value):
-    window_s = _window_to_seconds(window_value)
+def update_metrics_grid(n, subject_code, method_value):
+    # Hep kısa pencere (örn. son 5 dk) kullanıyoruz
+    window_s = float(DEFAULT_WINDOW_S)
 
-    params = {"subject": subject_code}
-    if window_s is not None:
-        params["window_s"] = window_s
-
+    params = {"subject": subject_code, "window_s": window_s}
     metrics = _fetch_from_api("/metrics/time", params)
     if not metrics:
         metrics = get_time_domain_metrics(subject_code, window_length_s=window_s)
@@ -554,22 +597,18 @@ def update_metrics_grid(n, subject_code, window_value):
     Output("hr-graph", "figure"),
     Input("refresh", "n_intervals"),
     Input("subject-dropdown", "value"),
-    Input("window-dropdown", "value"),
+    Input("method-radio", "value"),
 )
-def update_hr_graph(n, subject_code, window_value):
-    window_s = _window_to_seconds(window_value)
+def update_hr_graph(n, subject_code, method_value):
+    window_s = float(DEFAULT_WINDOW_S)
 
-    # 1) API'den dene
-    params = {"subject": subject_code}
-    if window_s is not None:
-        params["window_s"] = window_s
+    params = {"subject": subject_code, "window_s": window_s}
     data = _fetch_from_api("/metrics/hr_timeseries", params)
 
     if data and data.get("t_sec") and data.get("hr_bpm"):
         t_sec = np.array(data["t_sec"], dtype=float)
         hr_bpm = np.array(data["hr_bpm"], dtype=float)
     else:
-        # 2) API hata verirse / endpoint yoksa lokal servise fallback
         t_sec, hr_bpm = get_hr_timeseries(subject_code, window_length_s=window_s)
 
     fig = go.Figure()
@@ -603,131 +642,200 @@ def update_hr_graph(n, subject_code, window_value):
     Output("band-pie-graph", "figure"),
     Input("refresh", "n_intervals"),
     Input("subject-dropdown", "value"),
-    Input("window-dropdown", "value"),
+    Input("method-radio", "value"),
 )
-def update_vmdon_graphs(n, subject_code, window_value):
+def update_middle_panel(n, subject_code, method_value):
     """
-    Ortadaki panel: VMDON bileşenleri (time-series) + VMDON band power (pie).
+    Orta panel:
+      - VMDON (online) => eski grafikleri göster
+      - AVMD Spark (offline) => Spark parquet'ten band / metrik bar + pie
     """
-    window_s = _window_to_seconds(window_value)
+    # ----------------- VMDON ONLINE MODU ----------------- #
+    if method_value == "vmdon":
+        window_s = float(DEFAULT_WINDOW_S)
+        params = {"subject": subject_code, "window_s": window_s}
 
-    params = {"subject": subject_code}
-    if window_s is not None:
-        params["window_s"] = window_s
+        data = _fetch_from_api("/metrics/vmdon", params)
+        if not data or not data.get("t_sec"):
+            data = get_vmdon_components(subject_code, window_length_s=window_s)
 
-    # 1) API üzerinden dene
-    data = _fetch_from_api("/metrics/vmdon", params)
+        t_sec = np.array(data.get("t_sec", []), dtype=float)
+        hf = np.array(data.get("hf", []), dtype=float)
+        lf = np.array(data.get("lf", []), dtype=float)
+        vlf = np.array(data.get("vlf", []), dtype=float)
+        ulf = np.array(data.get("ulf", []), dtype=float)
 
-    # 2) API çalışmazsa lokal servise fallback
-    if not data or not data.get("t_sec"):
-        data = get_vmdon_components(subject_code, window_length_s=window_s)
+        comp_fig = go.Figure()
 
-    t_sec = np.array(data.get("t_sec", []), dtype=float)
-    hf = np.array(data.get("hf", []), dtype=float)
-    lf = np.array(data.get("lf", []), dtype=float)
-    vlf = np.array(data.get("vlf", []), dtype=float)
-    ulf = np.array(data.get("ulf", []), dtype=float)
-
-    # --------- BİRİNCİ GRAFİK: BİLEŞENLER ZAMAN SERİSİ ---------
-    comp_fig = go.Figure()
-
-    if t_sec.size > 0 and hf.size == t_sec.size:
-        comp_fig.add_trace(
-            go.Scatter(
-                x=t_sec,
-                y=hf,
-                mode="lines",
-                name="HF",
-                line=dict(width=1.8, color=PALETTE["accent"]),
+        if t_sec.size > 0 and hf.size == t_sec.size:
+            comp_fig.add_trace(
+                go.Scatter(
+                    x=t_sec,
+                    y=hf,
+                    mode="lines",
+                    name="HF",
+                    line=dict(width=1.8, color=PALETTE["accent"]),
+                )
             )
-        )
-    if t_sec.size > 0 and lf.size == t_sec.size:
-        comp_fig.add_trace(
-            go.Scatter(
-                x=t_sec,
-                y=lf,
-                mode="lines",
-                name="LF",
-                line=dict(width=1.4),
+        if t_sec.size > 0 and lf.size == t_sec.size:
+            comp_fig.add_trace(
+                go.Scatter(
+                    x=t_sec,
+                    y=lf,
+                    mode="lines",
+                    name="LF",
+                    line=dict(width=1.4),
+                )
             )
-        )
-    if t_sec.size > 0 and vlf.size == t_sec.size:
-        comp_fig.add_trace(
-            go.Scatter(
-                x=t_sec,
-                y=vlf,
-                mode="lines",
-                name="VLF",
-                line=dict(width=1.2),
+        if t_sec.size > 0 and vlf.size == t_sec.size:
+            comp_fig.add_trace(
+                go.Scatter(
+                    x=t_sec,
+                    y=vlf,
+                    mode="lines",
+                    name="VLF",
+                    line=dict(width=1.2),
+                )
             )
-        )
-    if t_sec.size > 0 and ulf.size == t_sec.size:
-        comp_fig.add_trace(
-            go.Scatter(
-                x=t_sec,
-                y=ulf,
-                mode="lines",
-                name="ULF",
-                line=dict(width=1.0, dash="dot"),
+        if t_sec.size > 0 and ulf.size == t_sec.size:
+            comp_fig.add_trace(
+                go.Scatter(
+                    x=t_sec,
+                    y=ulf,
+                    mode="lines",
+                    name="ULF",
+                    line=dict(width=1.0, dash="dot"),
+                )
             )
+
+        comp_fig.update_layout(
+            title="VMDON components (HF / LF / VLF / ULF)",
+            xaxis_title="Time (s)",
+            yaxis_title="Component amplitude (RR, s)",
+            template="plotly_white",
+            margin=dict(l=40, r=20, t=30, b=40),
+            height=260,
+            plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#FFFFFF",
+            xaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
+            yaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
+            legend=dict(orientation="h", y=-0.25),
         )
 
-    comp_fig.update_layout(
-        title="VMDON components (HF / LF / VLF / ULF)",
-        xaxis_title="Time (s)",
-        yaxis_title="Component amplitude (RR, s)",
+        def _band_power(x: np.ndarray) -> float:
+            if x.size == 0:
+                return 0.0
+            x = x - np.mean(x)
+            return float(np.var(x))
+
+        vlf_p = _band_power(vlf)
+        lf_p = _band_power(lf)
+        hf_p = _band_power(hf)
+        ulf_p = _band_power(ulf)
+
+        labels = ["VLF", "LF", "HF", "ULF"]
+        values = [vlf_p, lf_p, hf_p, ulf_p]
+
+        pie_fig = go.Figure(
+            data=[go.Pie(labels=labels, values=values, hole=0.55)]
+        )
+        pie_fig.update_layout(
+            title="VMDON band power distribution",
+            template="plotly_white",
+            margin=dict(l=10, r=10, t=30, b=20),
+            height=220,
+            showlegend=True,
+        )
+
+        return comp_fig, pie_fig
+
+    # ----------------- AVMD SPARK OFFLINE MODU ----------------- #
+    # df_avmd_spark global
+    if df_avmd_spark is None or df_avmd_spark.empty:
+        msg = "Spark AVMD results not found. Run PySpark job first."
+        empty1 = _empty_figure("AVMD Spark band metrics", msg)
+        empty2 = _empty_figure("AVMD Spark distribution", msg)
+        return empty1, empty2
+
+    df_sub = df_avmd_spark[df_avmd_spark["subject"] == subject_code]
+    if df_sub.empty:
+        msg = f"No Spark AVMD row for subject {subject_code}."
+        empty1 = _empty_figure("AVMD Spark band metrics", msg)
+        empty2 = _empty_figure("AVMD Spark distribution", msg)
+        return empty1, empty2
+
+    row = df_sub.iloc[0]
+
+    # subject / method dışındaki numerik kolonları al
+    numeric_cols = []
+    numeric_vals = []
+    for col in df_sub.columns:
+        if col in ("subject", "method"):
+            continue
+        try:
+            if np.issubdtype(df_sub[col].dtype, np.number):
+                numeric_cols.append(col)
+                numeric_vals.append(float(row[col]))
+        except Exception:
+            continue
+
+    if not numeric_cols:
+        msg = "No numeric AVMD band/metric columns to display."
+        empty1 = _empty_figure("AVMD Spark band metrics", msg)
+        empty2 = _empty_figure("AVMD Spark distribution", msg)
+        return empty1, empty2
+
+    labels = [c.replace("_", " ") for c in numeric_cols]
+
+    # 1) Bar chart
+    bar_fig = go.Figure(
+        data=[go.Bar(x=labels, y=numeric_vals)]
+    )
+    bar_fig.update_layout(
+        title=f"AVMD Spark metrics for Subject {subject_code}",
+        xaxis_title="Band / metric",
+        yaxis_title="Value",
         template="plotly_white",
         margin=dict(l=40, r=20, t=30, b=40),
         height=260,
         plot_bgcolor="#FFFFFF",
         paper_bgcolor="#FFFFFF",
-        xaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
+        xaxis=dict(showgrid=True, gridcolor="#EDF2F7", tickangle=-30),
         yaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
-        legend=dict(orientation="h", y=-0.25),
     )
 
-    # --------- İKİNCİ GRAFİK: VMDON BAND POWER (VARIANCE) ---------
-    def _band_power(x: np.ndarray) -> float:
-        if x.size == 0:
-            return 0.0
-        x = x - np.mean(x)
-        return float(np.var(x))
+    # 2) Pie chart (oran)
+    total = sum(numeric_vals)
+    if total <= 0:
+        pie_fig = _empty_figure(
+            "AVMD Spark distribution",
+            "Non-positive values; cannot build pie chart.",
+        )
+    else:
+        pie_fig = go.Figure(
+            data=[go.Pie(labels=labels, values=numeric_vals, hole=0.55)]
+        )
+        pie_fig.update_layout(
+            title="AVMD Spark relative distribution",
+            template="plotly_white",
+            margin=dict(l=10, r=10, t=30, b=20),
+            height=220,
+            showlegend=True,
+        )
 
-    vlf_p = _band_power(vlf)
-    lf_p = _band_power(lf)
-    hf_p = _band_power(hf)
-    ulf_p = _band_power(ulf)
-
-    labels = ["VLF", "LF", "HF", "ULF"]
-    values = [vlf_p, lf_p, hf_p, ulf_p]
-
-    pie_fig = go.Figure(
-        data=[go.Pie(labels=labels, values=values, hole=0.55)]
-    )
-    pie_fig.update_layout(
-        title="VMDON band power distribution",
-        template="plotly_white",
-        margin=dict(l=10, r=10, t=30, b=20),
-        height=220,
-        showlegend=True,
-    )
-
-    return comp_fig, pie_fig
+    return bar_fig, pie_fig
 
 
 @app.callback(
     Output("poincare-graph", "figure"),
     Input("refresh", "n_intervals"),
     Input("subject-dropdown", "value"),
-    Input("window-dropdown", "value"),
+    Input("method-radio", "value"),
 )
-def update_poincare_graph(n, subject_code, window_value):
-    window_s = _window_to_seconds(window_value)
+def update_poincare_graph(n, subject_code, method_value):
+    window_s = float(DEFAULT_WINDOW_S)
 
-    params = {"subject": subject_code}
-    if window_s is not None:
-        params["window_s"] = window_s
-
+    params = {"subject": subject_code, "window_s": window_s}
     data = _fetch_from_api("/metrics/poincare", params)
     if not data:
         data = get_poincare_data(subject_code, window_length_s=window_s)
@@ -766,15 +874,12 @@ def update_poincare_graph(n, subject_code, window_value):
     Output("poincare-metrics", "children"),
     Input("refresh", "n_intervals"),
     Input("subject-dropdown", "value"),
-    Input("window-dropdown", "value"),
+    Input("method-radio", "value"),
 )
-def update_poincare_metrics(n, subject_code, window_value):
-    window_s = _window_to_seconds(window_value)
+def update_poincare_metrics(n, subject_code, method_value):
+    window_s = float(DEFAULT_WINDOW_S)
 
-    params = {"subject": subject_code}
-    if window_s is not None:
-        params["window_s"] = window_s
-
+    params = {"subject": subject_code, "window_s": window_s}
     data = _fetch_from_api("/metrics/poincare", params)
     if not data:
         data = get_poincare_data(subject_code, window_length_s=window_s)
@@ -801,7 +906,6 @@ def update_subject_info(n, subject_code):
     sex = info.get("sex")
     group = info.get("group")
 
-    # Age string
     if age is None:
         age_str = "Unknown"
     else:
@@ -813,7 +917,6 @@ def update_subject_info(n, subject_code):
     sex_str = "-" if sex in (None, "", float("nan")) else str(sex)
     group_str = "" if group in (None, "") else f" · Group: {group}"
 
-    # ---- FIGURE SEÇİMİ ----
     sex_norm = str(sex).strip().lower() if sex is not None else ""
 
     if sex_norm.startswith("m"):
@@ -825,7 +928,6 @@ def update_subject_info(n, subject_code):
 
     figure_src = app.get_asset_url(filename)
 
-    # ---- TEXT ----
     info_children = [
         html.Span(
             f"Subject {info.get('code', subject_code)}",
@@ -843,15 +945,12 @@ def update_subject_info(n, subject_code):
     Output("signal-quality-text", "children"),
     Input("refresh", "n_intervals"),
     Input("subject-dropdown", "value"),
-    Input("window-dropdown", "value"),
+    Input("method-radio", "value"),
 )
-def update_status_bar(n, subject_code, window_value):
-    window_s = _window_to_seconds(window_value)
+def update_status_bar(n, subject_code, method_value):
+    window_s = float(DEFAULT_WINDOW_S)
 
-    params = {"subject": subject_code}
-    if window_s is not None:
-        params["window_s"] = window_s
-
+    params = {"subject": subject_code, "window_s": window_s}
     status = _fetch_from_api("/metrics/status", params)
     if not status:
         status = get_signal_status(subject_code, window_length_s=window_s)
@@ -873,5 +972,6 @@ def update_status_bar(n, subject_code, window_value):
 # ----------------- MAIN ----------------- #
 
 if __name__ == "__main__":
-    start_consumer_background()
+    # Sadece Dash’i çalıştır. Kafka consumer FastAPI içinde çalışacak.
     app.run(debug=True)
+

@@ -1,4 +1,3 @@
-# src/config/settings.py
 """
 Central application configuration for the HRV realtime project.
 
@@ -29,6 +28,7 @@ class PathSettings:
     """
 
     base_dir: Path = BASE_DIR
+
     raw_data_dir: Path = (
         BASE_DIR
         / "Datas"
@@ -38,8 +38,14 @@ class PathSettings:
         / "rr-interval-healthy-subjects"
         / "1.0.0"
     )
+
     rr_processed_dir: Path = BASE_DIR / "data" / "processed" / "rr_clean"
+
     patient_info_path: Path = BASE_DIR / "Datas" / "processed" / "patient-info.csv"
+
+    # Spark AVMD job'unun yazdığı HRV band parquet dosyası
+    # python src/spark/hrv_vmd_spark.py --method avmd --max-minutes 30 --output data/processed/hrv_bands_avmd.parquet
+    hrv_bands_avmd_path: Path = BASE_DIR / "data" / "processed" / "hrv_bands_avmd.parquet"
 
 
 @dataclass(frozen=True)
@@ -99,7 +105,6 @@ class DashboardSettings:
     max_poincare_points: int = 1000
 
 
-
 @dataclass(frozen=True)
 class ApiSettings:
     """
@@ -114,10 +119,10 @@ class AppSettings:
     kafka: KafkaSettings = KafkaSettings()
     hrv: HRVSettings = HRVSettings()
     dashboard: DashboardSettings = DashboardSettings()
-    api: ApiSettings = ApiSettings()  # <--- BURAYI EKLE
-
-
+    api: ApiSettings = ApiSettings()  # FastAPI base URL
 
 
 # Tek global config objesi
 settings = AppSettings()
+
+

@@ -1,13 +1,12 @@
-# src/api/fastapi_app.py
 """
 FastAPI-based HRV metrics service.
 
 Bu servis:
     - Kafka -> rr_consumer -> GLOBAL_RR_BUFFER üzerinden gelen RR serisini kullanır.
-    - service_hrv.py içindeki fonksiyonlarla time / freq / poincare metriklerini hesaplar.
+    - service_hrv.py içindeki fonksiyonlarla time / freq / poincare / VMDON / AVMD-Spark metriklerini hesaplar.
     - Subject listesi, subject bilgisi ve HR time-series dahil tüm verileri REST endpoint'leri olarak sunar.
 
-Endpointler:
+Endpointler (özet):
     - GET /health
     - GET /subjects
     - GET /subjects/{subject_code}
@@ -16,6 +15,9 @@ Endpointler:
     - GET /metrics/poincare
     - GET /metrics/status
     - GET /metrics/hr_series
+    - GET /metrics/hr_timeseries
+    - GET /metrics/vmdon
+    - GET /metrics/avmd_bands   <-- Spark AVMD band özetleri
 """
 
 import sys
@@ -40,24 +42,22 @@ from src.hrv_metrics.service_hrv import (
     get_available_subject_codes,
     get_subject_info,
     get_hr_timeseries,
-    get_vmdon_components,   # <-- bunu ekle
-
+    get_vmdon_components,
+    get_avmd_spark_bands,   # <-- Spark AVMD parquet okuyan fonksiyon
 )
 from src.utils.logging_utils import get_logger
-from fastapi import FastAPI, Query
-from typing import Dict, Any
 
 # FastAPI app instance
 app = FastAPI(
     title="HRV Realtime Metrics API",
-    version="1.1.0",
-    description="Provides time, frequency and non-linear HRV metrics as REST endpoints.",
+    version="1.2.0",
+    description="Provides time, frequency, non-linear and VMD-based HRV metrics as REST endpoints.",
 )
 
-# CORS (simdilik gelistirme icin herkese acik)
+# CORS (şimdilik geliştirme için herkese açık)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # gelistirme icin serbest; production'da daraltirsin
+    allow_origins=["*"],   # geliştirme için serbest; production'da daraltırsın
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,19 +67,21 @@ app.add_middleware(
 logger = get_logger(module_name="hrv_api", logfile_name="api.log")
 
 
-# --- Helper: window paramini saniyeye cevir --- #
+# -------------------------------------------------------------------
+# Helper: window paramını saniyeye çevir
+# -------------------------------------------------------------------
 
 def _resolve_window_s(
     window: Optional[str],
     window_s: Optional[float],
 ) -> Optional[float]:
     """
-    window / window_s parametrelerini tek bir window_length_s degerine indirger.
+    window / window_s parametrelerini tek bir window_length_s değerine indirger.
 
-    Oncelik sirasi:
-        1) window_s (saniye cinsinden dogrudan)
+    Öncelik sırası:
+        1) window_s (saniye cinsinden doğrudan)
         2) window == "last_5min" -> settings.dashboard.default_window_s
-        3) window == "full" veya None -> None (tum kayit / buffer)
+        3) window == "full" veya None -> None (tüm kayıt / buffer)
     """
     if window_s is not None:
         try:
@@ -92,16 +94,18 @@ def _resolve_window_s(
     if window == "last_5min":
         return float(settings.dashboard.default_window_s)
 
-    # "full" veya None: tum kayit
+    # "full" veya None: tüm kayıt
     return None
 
 
-# --- Startup: Kafka consumer thread --- #
+# -------------------------------------------------------------------
+# Startup: Kafka consumer thread
+# -------------------------------------------------------------------
 
 @app.on_event("startup")
 def startup_event() -> None:
     """
-    Uygulama baslarken Kafka consumer'ı arka planda baslatir.
+    Uygulama başlarken Kafka consumer'ı arka planda başlatır.
     """
     logger.info(
         "FastAPI HRV service starting up. Kafka bootstrap='%s', topic='%s', group_id='%s'",
@@ -113,22 +117,26 @@ def startup_event() -> None:
     logger.info("Background Kafka consumer thread requested from FastAPI startup.")
 
 
-# --- Health check --- #
+# -------------------------------------------------------------------
+# Health check
+# -------------------------------------------------------------------
 
 @app.get("/health")
 def health() -> Dict[str, str]:
     """
-    Basit saglik kontrolu endpoint'i.
+    Basit sağlık kontrolü endpoint'i.
     """
     return {"status": "ok"}
 
 
-# --- Subject list & info --- #
+# -------------------------------------------------------------------
+# Subject list & info
+# -------------------------------------------------------------------
 
 @app.get("/subjects")
 def list_subjects() -> Dict[str, List[str]]:
     """
-    Mevcut subject kodlarinin listesini dondurur.
+    Mevcut subject kodlarının listesini döndürür.
     """
     codes = get_available_subject_codes()
     logger.info("GET /subjects -> %d subjects", len(codes))
@@ -138,14 +146,16 @@ def list_subjects() -> Dict[str, List[str]]:
 @app.get("/subjects/{subject_code}")
 def subject_info(subject_code: str) -> Dict[str, Any]:
     """
-    Tek bir subject icin metadata bilgisi dondurur.
+    Tek bir subject için metadata bilgisi döndürür.
     """
     info = get_subject_info(subject_code)
     logger.info("GET /subjects/%s", subject_code)
     return info
 
 
-# --- Time-domain metrics endpoint --- #
+# -------------------------------------------------------------------
+# Time-domain metrics endpoint
+# -------------------------------------------------------------------
 
 @app.get("/metrics/time")
 def time_metrics(
@@ -175,7 +185,9 @@ def time_metrics(
     return metrics
 
 
-# --- Frequency-domain metrics endpoint --- #
+# -------------------------------------------------------------------
+# Frequency-domain metrics endpoint
+# -------------------------------------------------------------------
 
 @app.get("/metrics/freq")
 def freq_metrics(
@@ -194,7 +206,7 @@ def freq_metrics(
     ),
 ) -> Dict[str, Any]:
     """
-    Frekans-domeni HRV metrikleri (VLF/LF/HF bant gucleri, LF/HF oranı, PSD spektrumu).
+    Frekans-domeni HRV metrikleri (VLF/LF/HF bant güçleri, LF/HF oranı, PSD spektrumu).
     """
     window_length_s = _resolve_window_s(window, window_s)
     fs = float(fs_resample) if fs_resample is not None else float(settings.hrv.fs_resample)
@@ -216,7 +228,9 @@ def freq_metrics(
     return fd
 
 
-# --- Poincare / non-linear metrics endpoint --- #
+# -------------------------------------------------------------------
+# Poincare / non-linear metrics endpoint
+# -------------------------------------------------------------------
 
 @app.get("/metrics/poincare")
 def poincare_metrics(
@@ -238,7 +252,7 @@ def poincare_metrics(
     Poincare tabanlı non-linear HRV metrikleri:
         - SD1, SD2, SD1/SD2
         - stress_index
-        - opsiyonel scatter verisi (x, y)
+        - scatter verisi (x, y)
     """
     window_length_s = _resolve_window_s(window, window_s)
     mp = max_points if max_points is not None else settings.dashboard.max_poincare_points
@@ -260,7 +274,9 @@ def poincare_metrics(
     return data
 
 
-# --- Signal quality / status endpoint --- #
+# -------------------------------------------------------------------
+# Signal quality / status endpoint
+# -------------------------------------------------------------------
 
 @app.get("/metrics/status")
 def status_metrics(
@@ -275,7 +291,7 @@ def status_metrics(
     ),
 ) -> Dict[str, Any]:
     """
-    Sinyal kalitesi ozeti:
+    Sinyal kalitesi özeti:
         - quality_label (OK / Moderate / Poor / Short recording / No data)
         - status_text
         - outlier_percent
@@ -295,7 +311,9 @@ def status_metrics(
     return status
 
 
-# --- HR time-series endpoint (for Dash HR graph) --- #
+# -------------------------------------------------------------------
+# HR time-series endpoint (v1 - hr_series)
+# -------------------------------------------------------------------
 
 @app.get("/metrics/hr_series")
 def hr_series_metrics(
@@ -310,7 +328,7 @@ def hr_series_metrics(
     ),
 ) -> Dict[str, Any]:
     """
-    HR time-series (kalp hizi) icin zaman ve bpm degerlerini dondurur.
+    HR time-series (kalp hızı) için zaman ve bpm değerlerini döndürür.
     """
     window_length_s = _resolve_window_s(window, window_s)
     logger.info(
@@ -326,7 +344,6 @@ def hr_series_metrics(
         window_length_s=window_length_s,
     )
 
-    # JSON icin list'e cevir
     t_list = [float(t) for t in t_sec]
     hr_list = [float(h) for h in hr_bpm]
 
@@ -336,11 +353,10 @@ def hr_series_metrics(
         "n_points": len(t_list),
     }
 
-# --- HR time-series endpoint --- #
 
-from typing import Any  # en üstte varsa tekrar ekleme
-
-# --- HR time-series endpoint --- #
+# -------------------------------------------------------------------
+# HR time-series endpoint (v2 - hr_timeseries, Dash kullanıyor)
+# -------------------------------------------------------------------
 
 @app.get("/metrics/hr_timeseries")
 def hr_timeseries(
@@ -358,6 +374,9 @@ def hr_timeseries(
         description="Maximum number of HR points to return.",
     ),
 ) -> Dict[str, Any]:
+    """
+    HR zaman serisini (t_sec, hr_bpm) döndürür, maksimum nokta sayısı sınırlanabilir.
+    """
     window_length_s = _resolve_window_s(window, window_s)
     mp = max_points if max_points is not None else settings.dashboard.max_hr_points
 
@@ -383,32 +402,21 @@ def hr_timeseries(
     }
 
 
-
-# --- Local run entrypoint (uvicorn) --- #
-
-if __name__ == "__main__":
-    # Gelistirme icin:
-    #   uvicorn src.api.fastapi_app:app --reload
-    # yerine:
-    #   python src/api/fastapi_app.py
-    # ile de calistirabilmek icin ufak bir convenience.
-    import uvicorn
-
-    uvicorn.run(
-        "src.api.fastapi_app:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True,
-    )
-
+# -------------------------------------------------------------------
+# VMDON components endpoint
+# -------------------------------------------------------------------
 
 @app.get("/metrics/vmdon")
 def vmdon_metrics(
-    subject: str,
-    window_s: float | None = Query(None),
+    subject: str = Query(..., description="Subject code, e.g. '000'"),
+    window_s: float | None = Query(
+        None,
+        description="Window length in seconds for local VMDON; if None, uses full buffer/recording.",
+    ),
 ) -> Dict[str, Any]:
     """
     VMDON-based HF/LF/VLF/ULF components for the given subject/window.
+    Lokal Python VMDON algoritmasını kullanır (Spark değil).
     """
     if window_s is not None and window_s <= 0:
         window_s = None
@@ -419,3 +427,51 @@ def vmdon_metrics(
     )
     logger.info("GET /metrics/vmdon subject=%s window_s=%s", subject, window_s)
     return data
+
+
+# -------------------------------------------------------------------
+# AVMD Spark band summaries endpoint
+# -------------------------------------------------------------------
+
+@app.get("/metrics/avmd_bands")
+def avmd_bands_metrics(
+    subject: str = Query(..., description="Subject code, e.g. '000'"),
+) -> Dict[str, Any]:
+    """
+    Spark AVMD job'ının (hrv_vmd_spark.py) ürettiği band özetlerini döner.
+
+    Spark job'u:
+        python src/spark/hrv_vmd_spark.py --method avmd --max-minutes 30 \
+            --output data/processed/hrv_bands_avmd.parquet
+
+    Dash tarafında “AVMD (Spark)” seçildiğinde bu endpoint'e istek atabilirsin.
+    """
+    data = get_avmd_spark_bands(subject_code=subject)
+    n_bands = len(data.get("bands", []))
+    logger.info(
+        "GET /metrics/avmd_bands subject=%s -> %d bands, lf_hf_ratio=%s",
+        subject,
+        n_bands,
+        data.get("lf_hf_ratio"),
+    )
+    return data
+
+
+# -------------------------------------------------------------------
+# Local run entrypoint (uvicorn)
+# -------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Geliştirme için:
+    #   uvicorn src.api.fastapi_app:app --reload
+    # yerine:
+    #   python src/api/fastapi_app.py
+    # ile de çalıştırabilmek için.
+    import uvicorn
+
+    uvicorn.run(
+        "src.api.fastapi_app:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+    )
