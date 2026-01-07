@@ -18,6 +18,8 @@ Konfigürasyon:
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from src.utils.logging_utils import get_logger
+from scipy.interpolate import CubicSpline
+from scipy.signal import welch
 
 import numpy as np
 import pandas as pd
@@ -29,7 +31,7 @@ from scipy.signal import welch
 
 from src.config.settings import settings
 from src.streaming.rr_buffer import GLOBAL_RR_BUFFER
-
+from vmdpy import VMD
 
 # Canlı mod (True) iken, RR kaynağı sadece GLOBAL_RR_BUFFER'dır.
 # False yapılırsa, RR verisi yoksa CSV fallback devreye girer (offline analiz).
@@ -39,6 +41,18 @@ LIVE_ONLY: bool = True
 PATIENT_INFO_PATH: Path = settings.paths.patient_info_path
 RR_DIR: Path = settings.paths.rr_processed_dir
 
+# VMDON parametreleri (offline script ile uyumlu)
+VMD_ALPHA: float = 2000.0
+VMD_TAU: float = 0.0
+VMD_INIT: int = 1
+VMD_TOL: float = 1e-7
+
+VMDON_WINDOW_S: Dict[str, float] = {
+    "HF": 6.5,
+    "LF": 25.0,
+    "VLF": 303.0,
+    "ULF": 1800.0,
+}
 
 def get_available_subject_codes():
     """
@@ -379,6 +393,147 @@ def _compute_freq_domain_from_rr(
         "lf_hf_ratio": lf_hf_ratio,
     }
 
+def _rr_to_uniform_hrv(
+    rr: np.ndarray,
+    fs: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert RR intervals in seconds to a uniform HRV(t) signal at fs Hz."""
+    rr = np.asarray(rr, dtype=float)
+    if rr.size == 0:
+        return np.asarray([]), np.asarray([])
+
+    t_rr = np.cumsum(rr)
+    t_rr = t_rr - t_rr[0]
+
+    total_dur = float(t_rr[-1])
+    dt = 1.0 / fs
+    t_uniform = np.arange(0.0, total_dur, dt)
+    if t_uniform.size < 4:
+        hrv = np.interp(t_uniform, t_rr, rr)
+        return t_uniform, hrv
+
+    try:
+        cs = CubicSpline(t_rr, rr)
+        hrv = cs(t_uniform)
+    except Exception:
+        hrv = np.interp(t_uniform, t_rr, rr)
+
+    return t_uniform, hrv
+
+
+def _run_vmd_1mode(signal: np.ndarray, alpha: float) -> np.ndarray:
+    """Run single-mode VMD and return the decomposed component."""
+    x = np.asarray(signal, dtype=float)
+    if x.ndim != 1 or x.size < 10:
+        return np.zeros_like(x)
+
+    u, u_hat, omega = VMD(
+        x,
+        alpha,
+        VMD_TAU,
+        1,         # K=1
+        0,         # dc=0
+        VMD_INIT,
+        VMD_TOL,
+    )
+    # u shape: (K, N) -> (1, N)
+    return u[0]
+
+
+def _sliding_component_vmdon(
+    signal: np.ndarray,
+    fs: float,
+    window_s: float,
+    use_vmd: bool,
+    alpha: float,
+    stride: int,
+) -> np.ndarray:
+    """Compute one sliding-window VMDON component (HF/LF/VLF/ULF)."""
+    x = np.asarray(signal, dtype=float)
+    N = x.size
+    W = int(round(window_s * fs))
+    if W < 4 or W >= N:
+        return np.zeros_like(x)
+
+    acc = np.zeros(N, dtype=float)
+    cnt = np.zeros(N, dtype=float)
+    t_local = np.arange(W)
+
+    for start in range(0, N - W + 1, stride):
+        w = x[start:start + W]
+        p = np.polyfit(t_local, w, 1)
+        trend = np.polyval(p, t_local)
+        w_detr = w - trend
+
+        if use_vmd:
+            comp_win = _run_vmd_1mode(w_detr, alpha=alpha)
+        else:
+            comp_win = trend
+
+        acc[start:start + W] += comp_win
+        cnt[start:start + W] += 1.0
+
+    out = np.zeros(N, dtype=float)
+    m = cnt > 0
+    out[m] = acc[m] / cnt[m]
+    return out
+
+
+def _vmdon_decompose(
+    hrv: np.ndarray,
+    fs: float,
+    stride_hf: int = 1,
+    stride_lf: int = 2,
+    stride_vlf: int = 10,
+    stride_ulf: int = 60,
+) -> Dict[str, np.ndarray]:
+    """VMDon-like offline decomposition with sliding windows."""
+    x = np.asarray(hrv, dtype=float)
+    if x.size < 10:
+        return {
+            "HF": np.zeros_like(x),
+            "LF": np.zeros_like(x),
+            "VLF": np.zeros_like(x),
+            "ULF": np.zeros_like(x),
+        }
+
+    hf = _sliding_component_vmdon(
+        x, fs,
+        VMDON_WINDOW_S["HF"],
+        use_vmd=True,
+        alpha=VMD_ALPHA,
+        stride=stride_hf,
+    )
+    r = x - hf
+
+    lf = _sliding_component_vmdon(
+        r, fs,
+        VMDON_WINDOW_S["LF"],
+        use_vmd=True,
+        alpha=VMD_ALPHA,
+        stride=stride_lf,
+    )
+    r = r - lf
+
+    vlf = _sliding_component_vmdon(
+        r, fs,
+        VMDON_WINDOW_S["VLF"],
+        use_vmd=True,
+        alpha=VMD_ALPHA,
+        stride=stride_vlf,
+    )
+    r = r - vlf
+
+    ulf = _sliding_component_vmdon(
+        r, fs,
+        VMDON_WINDOW_S["ULF"],
+        use_vmd=False,
+        alpha=VMD_ALPHA,
+        stride=stride_ulf,
+    )
+
+    return {"HF": hf, "LF": lf, "VLF": vlf, "ULF": ulf}
+
 
 def get_freq_domain_metrics(
     subject_code: str,
@@ -413,6 +568,51 @@ def get_freq_domain_metrics(
     fd["window_length_s"] = window_length_s
     return fd
 
+def get_vmdon_components(
+    subject_code: str,
+    window_length_s: Optional[float] = None,
+    fs_resample: Optional[float] = None,
+) -> Dict[str, object]:
+    """Compute VMDON-based HF/LF/VLF/ULF components for a given subject/window."""
+    if fs_resample is None:
+        fs_resample = settings.hrv.fs_resample
+
+    rr = load_rr(subject_code, window_length_s=window_length_s)
+    if rr.size < 4:
+        return {
+            "t_sec": [],
+            "hf": [],
+            "lf": [],
+            "vlf": [],
+            "ulf": [],
+            "window_length_s": window_length_s,
+        }
+
+    # RR -> uniform HRV(t)
+    t_uniform, hrv = _rr_to_uniform_hrv(rr, fs=fs_resample)
+    if hrv.size < 10:
+        return {
+            "t_sec": t_uniform.tolist(),
+            "hf": [],
+            "lf": [],
+            "vlf": [],
+            "ulf": [],
+            "window_length_s": window_length_s,
+        }
+
+    # Basit detrend (mean)
+    hrv_detrended = hrv - np.mean(hrv)
+
+    comps = _vmdon_decompose(hrv_detrended, fs=fs_resample)
+
+    return {
+        "t_sec": t_uniform.tolist(),
+        "hf": comps["HF"].tolist(),
+        "lf": comps["LF"].tolist(),
+        "vlf": comps["VLF"].tolist(),
+        "ulf": comps["ULF"].tolist(),
+        "window_length_s": window_length_s,
+    }
 
 # -------------------- HR TIME-SERIES -------------------- #
 
@@ -673,3 +873,5 @@ def get_signal_status(subject_code: str, window_length_s: Optional[float] = None
     """
     rr = load_rr(subject_code, window_length_s=window_length_s)
     return _compute_signal_quality(rr)
+
+

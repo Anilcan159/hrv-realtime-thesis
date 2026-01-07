@@ -22,8 +22,8 @@ from src.hrv_metrics.service_hrv import (
     get_hr_timeseries,
     get_poincare_data,
     get_subject_info,
-    get_freq_domain_metrics,
     get_signal_status,
+    get_vmdon_components,
 )
 from src.streaming.rr_consumer import start_consumer_background
 
@@ -67,11 +67,10 @@ METRIC_CARD_STYLE = {
     "gap": "6px",
     "minHeight": "70px",
     "border": f"1px solid {PALETTE['border']}",
-    "alignItems": "center",       # ortala
-    "justifyContent": "center",   # dikeyde ortala
-    "textAlign": "center",        # metni ortala
+    "alignItems": "center",
+    "justifyContent": "center",
+    "textAlign": "center",
 }
-
 
 
 # ----------------- YARDIMCI FONKSİYONLAR ----------------- #
@@ -94,9 +93,6 @@ def _fetch_from_api(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 DEFAULT_WINDOW_S = settings.dashboard.default_window_s
-VLF_BAND = settings.hrv.vlf_band
-LF_BAND = settings.hrv.lf_band
-HF_BAND = settings.hrv.hf_band
 
 
 def _window_to_seconds(window_value: str | None) -> float | None:
@@ -130,7 +126,7 @@ def metric_card(title: str, value: str, unit: str = "") -> html.Div:
                 style={
                     "fontSize": "13px",
                     "fontWeight": "600",
-                    "color": PALETTE["primary"],     # <-- daha belirgin renk
+                    "color": PALETTE["primary"],
                     "letterSpacing": "0.06em",
                     "textTransform": "uppercase",
                     "textAlign": "center",
@@ -140,7 +136,7 @@ def metric_card(title: str, value: str, unit: str = "") -> html.Div:
                 style={
                     "display": "flex",
                     "alignItems": "baseline",
-                    "justifyContent": "center",      # <-- ortala
+                    "justifyContent": "center",
                     "gap": "4px",
                 },
                 children=[
@@ -205,7 +201,7 @@ app.layout = html.Div(
                                     "HRV Live Dashboard",
                                     style={
                                         "margin": 0,
-                                        "fontSize": "75px",   # büyütülmüş font
+                                        "fontSize": "75px",
                                         "fontWeight": "700",
                                         "letterSpacing": "0.02em",
                                     },
@@ -241,7 +237,7 @@ app.layout = html.Div(
                         # Sol: subject figürü
                         html.Img(
                             id="subject-figure",
-                            src=app.get_asset_url("Man.png"),   # başlangıçta kadın ya da herhangi biri
+                            src=app.get_asset_url("Man.png"),
                             style={
                                 "height": "160px",
                                 "width": "auto",
@@ -354,6 +350,7 @@ app.layout = html.Div(
                 ),
             ],
         ),
+
         # ---------- ANA GRID (3 PANEL) ---------- #
         html.Div(
             style={
@@ -423,34 +420,34 @@ app.layout = html.Div(
                     ],
                 ),
 
-                # FREQUENCY-DOMAIN PANEL
+                # VMDON PANEL (ortadaki panel, sadece VMDON)
                 html.Div(
-                style=PANEL_STYLE,
-                children=[
-                    html.H3(
-                        "Frequency-domain metrics",
-                        style={"marginBottom": "2px", "fontSize": "16px"},
-                    ),
-                    html.Span(
-                        "Spectral power (Welch) and VLF / LF / HF distribution",
-                        style={"fontSize": "12px", "color": PALETTE["muted"]},
-                    ),
+                    style=PANEL_STYLE,
+                    children=[
+                        html.H3(
+                            "VMDON components & band power",
+                            style={"marginBottom": "2px", "fontSize": "16px"},
+                        ),
+                        html.Span(
+                            "Adaptive HRV decomposition into HF / LF / VLF / ULF (VMDON)",
+                            style={"fontSize": "12px", "color": PALETTE["muted"]},
+                        ),
 
-                    # Üstte: PSD grafiği (tam genişlik)
-                    dcc.Graph(
-                        id="lf-hf-graph",
-                        style={"height": "260px", "marginTop": "10px"},
-                        config={"displayModeBar": False},
-                    ),
+                        # Üstte: VMDON bileşenleri (zaman serisi)
+                        dcc.Graph(
+                            id="vmdon-components-graph",
+                            style={"height": "260px", "marginTop": "10px"},
+                            config={"displayModeBar": False},
+                        ),
 
-                    # Altta: Pie chart (tam genişlik)
-                    dcc.Graph(
-                        id="band-pie-graph",
-                        style={"height": "230px", "marginTop": "6px"},
-                        config={"displayModeBar": False},
-                    ),
-                ],
-            ),
+                        # Altta: VMDON band power dağılımı (pie)
+                        dcc.Graph(
+                            id="band-pie-graph",
+                            style={"height": "230px", "marginTop": "6px"},
+                            config={"displayModeBar": False},
+                        ),
+                    ],
+                ),
 
                 # POINCARÉ PANELİ
                 html.Div(
@@ -602,127 +599,120 @@ def update_hr_graph(n, subject_code, window_value):
 
 
 @app.callback(
-    Output("lf-hf-graph", "figure"),
+    Output("vmdon-components-graph", "figure"),
     Output("band-pie-graph", "figure"),
     Input("refresh", "n_intervals"),
     Input("subject-dropdown", "value"),
     Input("window-dropdown", "value"),
 )
-def update_frequency_domain_graphs(n, subject_code, window_value):
+def update_vmdon_graphs(n, subject_code, window_value):
+    """
+    Ortadaki panel: VMDON bileşenleri (time-series) + VMDON band power (pie).
+    """
     window_s = _window_to_seconds(window_value)
 
     params = {"subject": subject_code}
     if window_s is not None:
         params["window_s"] = window_s
 
-    fd = _fetch_from_api("/metrics/freq", params)
-    if not fd:
-        fd = get_freq_domain_metrics(subject_code, window_length_s=window_s)
+    # 1) API üzerinden dene
+    data = _fetch_from_api("/metrics/vmdon", params)
 
-    freq = np.array(fd.get("freq", []), dtype=float)
-    psd = np.array(fd.get("psd", []), dtype=float)
-    band_powers = fd.get("band_powers", {})
+    # 2) API çalışmazsa lokal servise fallback
+    if not data or not data.get("t_sec"):
+        data = get_vmdon_components(subject_code, window_length_s=window_s)
 
-    # Boş durum
-    if freq.size == 0 or psd.size == 0:
-        empty_fig = go.Figure()
-        empty_fig.update_layout(
-            template="plotly_white",
-            margin=dict(l=40, r=20, t=20, b=40),
-            height=230,
-            plot_bgcolor="#FFFFFF",
-            paper_bgcolor="#FFFFFF",
-            xaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
-            yaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
+    t_sec = np.array(data.get("t_sec", []), dtype=float)
+    hf = np.array(data.get("hf", []), dtype=float)
+    lf = np.array(data.get("lf", []), dtype=float)
+    vlf = np.array(data.get("vlf", []), dtype=float)
+    ulf = np.array(data.get("ulf", []), dtype=float)
+
+    # --------- BİRİNCİ GRAFİK: BİLEŞENLER ZAMAN SERİSİ ---------
+    comp_fig = go.Figure()
+
+    if t_sec.size > 0 and hf.size == t_sec.size:
+        comp_fig.add_trace(
+            go.Scatter(
+                x=t_sec,
+                y=hf,
+                mode="lines",
+                name="HF",
+                line=dict(width=1.8, color=PALETTE["accent"]),
+            )
         )
-
-        pie_fig = go.Figure(
-            data=[
-                go.Pie(labels=["VLF", "LF", "HF"], values=[0, 0, 0], hole=0.55)
-            ]
+    if t_sec.size > 0 and lf.size == t_sec.size:
+        comp_fig.add_trace(
+            go.Scatter(
+                x=t_sec,
+                y=lf,
+                mode="lines",
+                name="LF",
+                line=dict(width=1.4),
+            )
         )
-        pie_fig.update_layout(
-            title="VLF / LF / HF power distribution",
-            template="plotly_white",
-            margin=dict(l=10, r=10, t=30, b=20),
-            height=220,
-            showlegend=True,
+    if t_sec.size > 0 and vlf.size == t_sec.size:
+        comp_fig.add_trace(
+            go.Scatter(
+                x=t_sec,
+                y=vlf,
+                mode="lines",
+                name="VLF",
+                line=dict(width=1.2),
+            )
         )
-        return empty_fig, pie_fig
-
-    max_psd = float(psd.max())
-
-    # PSD grafiği
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=freq,
-            y=psd,
-            mode="lines",
-            name="PSD (Welch)",
-            line=dict(width=2.5, color=PALETTE["primary"]),
-        )
-    )
-
-    bands = {"VLF": VLF_BAND, "LF": LF_BAND, "HF": HF_BAND}
-    colors = {
-        "VLF": "rgba(76, 111, 255, 0.08)",
-        "LF": "rgba(56, 161, 105, 0.10)",
-        "HF": "rgba(255, 139, 167, 0.12)",
-    }
-
-    shapes = []
-    for name, (f_low, f_high) in bands.items():
-        shapes.append(
-            dict(
-                type="rect",
-                xref="x",
-                yref="y",
-                x0=f_low,
-                x1=f_high,
-                y0=0,
-                y1=max_psd * 1.05,
-                fillcolor=colors[name],
-                line=dict(width=0),
-                layer="below",
+    if t_sec.size > 0 and ulf.size == t_sec.size:
+        comp_fig.add_trace(
+            go.Scatter(
+                x=t_sec,
+                y=ulf,
+                mode="lines",
+                name="ULF",
+                line=dict(width=1.0, dash="dot"),
             )
         )
 
-    fig.update_layout(
-        title="HRV power spectrum (Welch)",
-        xaxis_title="Frequency (Hz)",
-        yaxis_title="Power (ms²/Hz)",
+    comp_fig.update_layout(
+        title="VMDON components (HF / LF / VLF / ULF)",
+        xaxis_title="Time (s)",
+        yaxis_title="Component amplitude (RR, s)",
         template="plotly_white",
         margin=dict(l=40, r=20, t=30, b=40),
-        height=230,
-        shapes=shapes,
-        legend=dict(orientation="h", y=-0.25),
+        height=260,
         plot_bgcolor="#FFFFFF",
         paper_bgcolor="#FFFFFF",
         xaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
         yaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
+        legend=dict(orientation="h", y=-0.25),
     )
 
-    # Pasta grafiği
-    labels = ["VLF", "LF", "HF"]
-    values = [
-        band_powers.get("VLF", 0.0),
-        band_powers.get("LF", 0.0),
-        band_powers.get("HF", 0.0),
-    ]
+    # --------- İKİNCİ GRAFİK: VMDON BAND POWER (VARIANCE) ---------
+    def _band_power(x: np.ndarray) -> float:
+        if x.size == 0:
+            return 0.0
+        x = x - np.mean(x)
+        return float(np.var(x))
+
+    vlf_p = _band_power(vlf)
+    lf_p = _band_power(lf)
+    hf_p = _band_power(hf)
+    ulf_p = _band_power(ulf)
+
+    labels = ["VLF", "LF", "HF", "ULF"]
+    values = [vlf_p, lf_p, hf_p, ulf_p]
 
     pie_fig = go.Figure(
         data=[go.Pie(labels=labels, values=values, hole=0.55)]
     )
     pie_fig.update_layout(
-        title="VLF / LF / HF power distribution",
+        title="VMDON band power distribution",
         template="plotly_white",
         margin=dict(l=10, r=10, t=30, b=20),
         height=220,
         showlegend=True,
     )
 
-    return fig, pie_fig
+    return comp_fig, pie_fig
 
 
 @app.callback(
@@ -827,11 +817,11 @@ def update_subject_info(n, subject_code):
     sex_norm = str(sex).strip().lower() if sex is not None else ""
 
     if sex_norm.startswith("m"):
-        filename = "Man.png"      # VSCode’daki isimle birebir aynı!
+        filename = "Man.png"
     elif sex_norm.startswith("f"):
         filename = "woman.png"
     else:
-        filename = "woman.png"    # default
+        filename = "woman.png"
 
     figure_src = app.get_asset_url(filename)
 
@@ -846,6 +836,7 @@ def update_subject_info(n, subject_code):
     ]
 
     return info_children, figure_src
+
 
 @app.callback(
     Output("status-text", "children"),

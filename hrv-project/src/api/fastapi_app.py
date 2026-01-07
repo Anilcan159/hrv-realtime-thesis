@@ -40,9 +40,12 @@ from src.hrv_metrics.service_hrv import (
     get_available_subject_codes,
     get_subject_info,
     get_hr_timeseries,
+    get_vmdon_components,   # <-- bunu ekle
+
 )
 from src.utils.logging_utils import get_logger
-
+from fastapi import FastAPI, Query
+from typing import Dict, Any
 
 # FastAPI app instance
 app = FastAPI(
@@ -398,3 +401,21 @@ if __name__ == "__main__":
         reload=True,
     )
 
+
+@app.get("/metrics/vmdon")
+def vmdon_metrics(
+    subject: str,
+    window_s: float | None = Query(None),
+) -> Dict[str, Any]:
+    """
+    VMDON-based HF/LF/VLF/ULF components for the given subject/window.
+    """
+    if window_s is not None and window_s <= 0:
+        window_s = None
+
+    data = get_vmdon_components(
+        subject_code=subject,
+        window_length_s=window_s,
+    )
+    logger.info("GET /metrics/vmdon subject=%s window_s=%s", subject, window_s)
+    return data
