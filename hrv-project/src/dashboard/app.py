@@ -1,18 +1,18 @@
 # src/dashboard/app.py
 import os
 import sys
+import base64
+from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
-import pandas as pd                     # <<< YENİ
-from pathlib import Path               # <<< YENİ
 import requests
 from dash import Dash, html, dcc, Input, Output
 import plotly.graph_objects as go
 
 # ----------------- PROJE KÖKÜ ----------------- #
 
-CURRENT_DIR = os.path.dirname(__file__)                    # .../src/dashboard
+CURRENT_DIR = os.path.dirname(__file__)                       # .../src/dashboard
 PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))  # .../hrv-project
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
@@ -28,24 +28,8 @@ from src.hrv_metrics.service_hrv import (
     get_vmdon_components,
 )
 
-
-# ----------------- SPARK AVMD ÇIKTISI ----------------- #
-
-SPARK_PARQUET_PATH = (
-    Path(PROJECT_ROOT) / "data" / "processed" / "hrv_bands_avmd.parquet"
-)
-
-try:
-    if SPARK_PARQUET_PATH.exists():
-        df_avmd_spark = pd.read_parquet(SPARK_PARQUET_PATH)
-        print(f"[dashboard] Loaded Spark AVMD parquet: {SPARK_PARQUET_PATH}")
-    else:
-        print(f"[dashboard] Spark parquet not found: {SPARK_PARQUET_PATH}")
-        df_avmd_spark = pd.DataFrame()
-except Exception as e:
-    print(f"[dashboard] Failed to load Spark parquet: {e}")
-    df_avmd_spark = pd.DataFrame()
-
+# Offline AVMD plot klasörü (vmd_hrv_offline.py çıktıları)
+AVMD_PLOT_DIR = Path(PROJECT_ROOT) / "data" / "plots" / "avmd"
 
 # ----------------- RENK PALETİ (PASTEL) ----------------- #
 
@@ -91,8 +75,8 @@ METRIC_CARD_STYLE = {
     "textAlign": "center",
 }
 
-
 # ----------------- YARDIMCI FONKSİYONLAR ----------------- #
+
 
 def _fetch_from_api(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -195,6 +179,66 @@ def _empty_figure(title: str, message: str) -> go.Figure:
     return fig
 
 
+def _avmd_components_figure(subject_code: str) -> go.Figure:
+    """
+    Offline AVMD script'inin ürettiği PNG'yi orta panele tek blok olarak gömmek için.
+    Beklenen dosya:
+        data/plots/avmd/{subject}_avmd_components.png
+    """
+    img_path = AVMD_PLOT_DIR / f"{subject_code}_avmd_components.png"
+
+    if not img_path.exists():
+        msg = (
+            f"Offline AVMD figure not found for subject {subject_code}. "
+            f"Run vmd_hrv_offline.py --subject {subject_code} --method avmd ..."
+        )
+        return _empty_figure("Offline AVMD components", msg)
+
+    with open(img_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("ascii")
+
+    fig = go.Figure()
+    fig.add_layout_image(
+        dict(
+            source=f"data:image/png;base64,{encoded}",
+            xref="paper",
+            yref="paper",
+            x=0,
+            y=1,
+            sizex=1,
+            sizey=1,
+            xanchor="left",
+            yanchor="top",
+            sizing="stretch",
+        )
+    )
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=30, b=0),
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        height=320,  # orta panelin üst bloğunu yaklaşık doldursun
+    )
+    return fig
+
+
+def _tiny_empty_figure() -> go.Figure:
+    """İkinci grafiği AVMD modunda görünmez yapmak için minik boş figür."""
+    fig = go.Figure()
+    fig.update_layout(
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=20,
+        annotations=[],
+        showlegend=False,
+    )
+    return fig
+
+
 # ----------------- DASH APP & LAYOUT ----------------- #
 
 app = Dash(__name__)
@@ -211,7 +255,7 @@ app.layout = html.Div(
     children=[
         dcc.Interval(id="refresh", interval=1000, n_intervals=0),
 
-        # ---------- HEADER ----------
+        # ---------- HEADER ---------- #
         html.Div(
             style={
                 "display": "flex",
@@ -223,7 +267,6 @@ app.layout = html.Div(
                 # SOL: Başlık + ikon + tagline
                 html.Div(
                     children=[
-                        # Başlık + PNG aynı satırda
                         html.Div(
                             style={
                                 "display": "flex",
@@ -249,7 +292,6 @@ app.layout = html.Div(
                                 ),
                             ],
                         ),
-                        # Alt satır: tagline
                         html.Span(
                             "Real-time heart rate variability monitoring",
                             style={
@@ -268,7 +310,6 @@ app.layout = html.Div(
                         "gap": "18px",
                     },
                     children=[
-                        # Sol: subject figürü
                         html.Img(
                             id="subject-figure",
                             src=app.get_asset_url("Man.png"),
@@ -278,8 +319,6 @@ app.layout = html.Div(
                                 "display": "block",
                             },
                         ),
-
-                        # Sağ: subject + method kartı
                         html.Div(
                             style={
                                 "minWidth": "360px",
@@ -310,7 +349,6 @@ app.layout = html.Div(
                                         "gridGap": "8px",
                                     },
                                     children=[
-                                        # Subject dropdown
                                         html.Div(
                                             children=[
                                                 html.Label(
@@ -342,7 +380,6 @@ app.layout = html.Div(
                                                 ),
                                             ]
                                         ),
-                                        # Method seçimi (VMDON / AVMD Spark)
                                         html.Div(
                                             children=[
                                                 html.Label(
@@ -361,7 +398,7 @@ app.layout = html.Div(
                                                             "value": "vmdon",
                                                         },
                                                         {
-                                                            "label": "AVMD Spark (offline)",
+                                                            "label": "AVMD (offline)",
                                                             "value": "avmd_spark",
                                                         },
                                                     ],
@@ -467,7 +504,7 @@ app.layout = html.Div(
                     ],
                 ),
 
-                # ORTA PANEL: VMDON veya AVMD SPARK
+                # ORTA PANEL: VMDON veya AVMD offline
                 html.Div(
                     style=PANEL_STYLE,
                     children=[
@@ -476,19 +513,17 @@ app.layout = html.Div(
                             style={"marginBottom": "2px", "fontSize": "16px"},
                         ),
                         html.Span(
-                            "Online VMDON vs. offline PySpark AVMD",
+                            "Online VMDON vs. offline AVMD decomposition",
                             style={"fontSize": "12px", "color": PALETTE["muted"]},
                         ),
-
                         dcc.Graph(
                             id="vmdon-components-graph",
-                            style={"height": "260px", "marginTop": "10px"},
+                            style={"height": "320px", "marginTop": "10px"},
                             config={"displayModeBar": False},
                         ),
-
                         dcc.Graph(
                             id="band-pie-graph",
-                            style={"height": "230px", "marginTop": "6px"},
+                            style={"height": "160px", "marginTop": "6px"},
                             config={"displayModeBar": False},
                         ),
                     ],
@@ -571,12 +606,10 @@ app.layout = html.Div(
     Output("metrics-grid", "children"),
     Input("refresh", "n_intervals"),
     Input("subject-dropdown", "value"),
-    Input("method-radio", "value"),  # method input, şimdilik sadece tetiklemek için
+    Input("method-radio", "value"),
 )
 def update_metrics_grid(n, subject_code, method_value):
-    # Hep kısa pencere (örn. son 5 dk) kullanıyoruz
     window_s = float(DEFAULT_WINDOW_S)
-
     params = {"subject": subject_code, "window_s": window_s}
     metrics = _fetch_from_api("/metrics/time", params)
     if not metrics:
@@ -601,7 +634,6 @@ def update_metrics_grid(n, subject_code, method_value):
 )
 def update_hr_graph(n, subject_code, method_value):
     window_s = float(DEFAULT_WINDOW_S)
-
     params = {"subject": subject_code, "window_s": window_s}
     data = _fetch_from_api("/metrics/hr_timeseries", params)
 
@@ -647,8 +679,8 @@ def update_hr_graph(n, subject_code, method_value):
 def update_middle_panel(n, subject_code, method_value):
     """
     Orta panel:
-      - VMDON (online) => eski grafikleri göster
-      - AVMD Spark (offline) => Spark parquet'ten band / metrik bar + pie
+      - VMDON (online): Python VMDon-like decomposition
+      - AVMD (offline): Offline AVMD PNG (tek blok)
     """
     # ----------------- VMDON ONLINE MODU ----------------- #
     if method_value == "vmdon":
@@ -713,13 +745,13 @@ def update_middle_panel(n, subject_code, method_value):
             xaxis_title="Time (s)",
             yaxis_title="Component amplitude (RR, s)",
             template="plotly_white",
-            margin=dict(l=40, r=20, t=30, b=40),
-            height=260,
+            margin=dict(l=40, r=20, t=30, b=30),
+            height=320,
             plot_bgcolor="#FFFFFF",
             paper_bgcolor="#FFFFFF",
             xaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
             yaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
-            legend=dict(orientation="h", y=-0.25),
+            legend=dict(orientation="h", y=-0.2),
         )
 
         def _band_power(x: np.ndarray) -> float:
@@ -742,88 +774,17 @@ def update_middle_panel(n, subject_code, method_value):
         pie_fig.update_layout(
             title="VMDON band power distribution",
             template="plotly_white",
-            margin=dict(l=10, r=10, t=30, b=20),
-            height=220,
+            margin=dict(l=10, r=10, t=30, b=10),
+            height=160,
             showlegend=True,
         )
 
         return comp_fig, pie_fig
 
-    # ----------------- AVMD SPARK OFFLINE MODU ----------------- #
-    # df_avmd_spark global
-    if df_avmd_spark is None or df_avmd_spark.empty:
-        msg = "Spark AVMD results not found. Run PySpark job first."
-        empty1 = _empty_figure("AVMD Spark band metrics", msg)
-        empty2 = _empty_figure("AVMD Spark distribution", msg)
-        return empty1, empty2
-
-    df_sub = df_avmd_spark[df_avmd_spark["subject"] == subject_code]
-    if df_sub.empty:
-        msg = f"No Spark AVMD row for subject {subject_code}."
-        empty1 = _empty_figure("AVMD Spark band metrics", msg)
-        empty2 = _empty_figure("AVMD Spark distribution", msg)
-        return empty1, empty2
-
-    row = df_sub.iloc[0]
-
-    # subject / method dışındaki numerik kolonları al
-    numeric_cols = []
-    numeric_vals = []
-    for col in df_sub.columns:
-        if col in ("subject", "method"):
-            continue
-        try:
-            if np.issubdtype(df_sub[col].dtype, np.number):
-                numeric_cols.append(col)
-                numeric_vals.append(float(row[col]))
-        except Exception:
-            continue
-
-    if not numeric_cols:
-        msg = "No numeric AVMD band/metric columns to display."
-        empty1 = _empty_figure("AVMD Spark band metrics", msg)
-        empty2 = _empty_figure("AVMD Spark distribution", msg)
-        return empty1, empty2
-
-    labels = [c.replace("_", " ") for c in numeric_cols]
-
-    # 1) Bar chart
-    bar_fig = go.Figure(
-        data=[go.Bar(x=labels, y=numeric_vals)]
-    )
-    bar_fig.update_layout(
-        title=f"AVMD Spark metrics for Subject {subject_code}",
-        xaxis_title="Band / metric",
-        yaxis_title="Value",
-        template="plotly_white",
-        margin=dict(l=40, r=20, t=30, b=40),
-        height=260,
-        plot_bgcolor="#FFFFFF",
-        paper_bgcolor="#FFFFFF",
-        xaxis=dict(showgrid=True, gridcolor="#EDF2F7", tickangle=-30),
-        yaxis=dict(showgrid=True, gridcolor="#EDF2F7"),
-    )
-
-    # 2) Pie chart (oran)
-    total = sum(numeric_vals)
-    if total <= 0:
-        pie_fig = _empty_figure(
-            "AVMD Spark distribution",
-            "Non-positive values; cannot build pie chart.",
-        )
-    else:
-        pie_fig = go.Figure(
-            data=[go.Pie(labels=labels, values=numeric_vals, hole=0.55)]
-        )
-        pie_fig.update_layout(
-            title="AVMD Spark relative distribution",
-            template="plotly_white",
-            margin=dict(l=10, r=10, t=30, b=20),
-            height=220,
-            showlegend=True,
-        )
-
-    return bar_fig, pie_fig
+    # ----------------- AVMD OFFLINE MODU ----------------- #
+    comp_fig = _avmd_components_figure(subject_code)
+    tiny = _tiny_empty_figure()
+    return comp_fig, tiny
 
 
 @app.callback(
@@ -834,7 +795,6 @@ def update_middle_panel(n, subject_code, method_value):
 )
 def update_poincare_graph(n, subject_code, method_value):
     window_s = float(DEFAULT_WINDOW_S)
-
     params = {"subject": subject_code, "window_s": window_s}
     data = _fetch_from_api("/metrics/poincare", params)
     if not data:
@@ -878,7 +838,6 @@ def update_poincare_graph(n, subject_code, method_value):
 )
 def update_poincare_metrics(n, subject_code, method_value):
     window_s = float(DEFAULT_WINDOW_S)
-
     params = {"subject": subject_code, "window_s": window_s}
     data = _fetch_from_api("/metrics/poincare", params)
     if not data:
@@ -949,7 +908,6 @@ def update_subject_info(n, subject_code):
 )
 def update_status_bar(n, subject_code, method_value):
     window_s = float(DEFAULT_WINDOW_S)
-
     params = {"subject": subject_code, "window_s": window_s}
     status = _fetch_from_api("/metrics/status", params)
     if not status:
@@ -974,4 +932,3 @@ def update_status_bar(n, subject_code, method_value):
 if __name__ == "__main__":
     # Sadece Dash’i çalıştır. Kafka consumer FastAPI içinde çalışacak.
     app.run(debug=True)
-

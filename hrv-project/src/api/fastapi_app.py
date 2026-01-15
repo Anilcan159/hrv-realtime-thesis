@@ -1,12 +1,12 @@
 """
 FastAPI-based HRV metrics service.
 
-Bu servis:
-    - Kafka -> rr_consumer -> GLOBAL_RR_BUFFER üzerinden gelen RR serisini kullanır.
-    - service_hrv.py içindeki fonksiyonlarla time / freq / poincare / VMDON / AVMD-Spark metriklerini hesaplar.
-    - Subject listesi, subject bilgisi ve HR time-series dahil tüm verileri REST endpoint'leri olarak sunar.
+This service:
+    - Uses RR intervals coming from Kafka -> rr_consumer -> GLOBAL_RR_BUFFER.
+    - Relies on service_hrv.py for time / frequency / Poincaré / VMDON / AVMD-Spark metrics.
+    - Exposes subject list, subject info and HR time series as REST endpoints.
 
-Endpointler (özet):
+Endpoints (summary):
     - GET /health
     - GET /subjects
     - GET /subjects/{subject_code}
@@ -17,7 +17,7 @@ Endpointler (özet):
     - GET /metrics/hr_series
     - GET /metrics/hr_timeseries
     - GET /metrics/vmdon
-    - GET /metrics/avmd_bands   <-- Spark AVMD band özetleri
+    - GET /metrics/avmd_bands   <-- Spark AVMD band summaries (offline)
 """
 
 import sys
@@ -43,21 +43,24 @@ from src.hrv_metrics.service_hrv import (
     get_subject_info,
     get_hr_timeseries,
     get_vmdon_components,
-    get_avmd_spark_bands,   # <-- Spark AVMD parquet okuyan fonksiyon
+    get_avmd_spark_bands,
 )
 from src.utils.logging_utils import get_logger
 
 # FastAPI app instance
 app = FastAPI(
     title="HRV Realtime Metrics API",
-    version="1.2.0",
-    description="Provides time, frequency, non-linear and VMD-based HRV metrics as REST endpoints.",
+    version="1.3.0",
+    description=(
+        "Provides time-domain, frequency-domain, non-linear and VMD-based HRV metrics "
+        "as REST endpoints on top of a Kafka–FastAPI streaming stack."
+    ),
 )
 
 # CORS (şimdilik geliştirme için herkese açık)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # geliştirme için serbest; production'da daraltırsın
+    allow_origins=["*"],   # dev için serbest; production'da daraltılabilir
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -68,7 +71,7 @@ logger = get_logger(module_name="hrv_api", logfile_name="api.log")
 
 
 # -------------------------------------------------------------------
-# Helper: window paramını saniyeye çevir
+# Helper: resolve window param (named window vs seconds)
 # -------------------------------------------------------------------
 
 def _resolve_window_s(
@@ -94,7 +97,7 @@ def _resolve_window_s(
     if window == "last_5min":
         return float(settings.dashboard.default_window_s)
 
-    # "full" veya None: tüm kayıt
+    # "full" veya None: tüm kayıt / buffer
     return None
 
 
@@ -146,7 +149,7 @@ def list_subjects() -> Dict[str, List[str]]:
 @app.get("/subjects/{subject_code}")
 def subject_info(subject_code: str) -> Dict[str, Any]:
     """
-    Tek bir subject için metadata bilgisi döndürür.
+    Tek bir subject için metadata bilgisi döndürür (age, sex, group).
     """
     info = get_subject_info(subject_code)
     logger.info("GET /subjects/%s", subject_code)
@@ -170,7 +173,7 @@ def time_metrics(
     ),
 ) -> Dict[str, Any]:
     """
-    Time-domain HRV metrikleri (SDNN, RMSSD, pNN50, mean HR, HR min/max, HTI, TINN, vb.)
+    Time-domain HRV metrikleri (SDNN, RMSSD, pNN50, mean HR, HR min/max, HTI, TINN, vb.).
     """
     window_length_s = _resolve_window_s(window, window_s)
     logger.info(
@@ -202,14 +205,21 @@ def freq_metrics(
     ),
     fs_resample: Optional[float] = Query(
         None,
-        description="Resampling frequency for RR series (Hz). Defaults to settings.hrv.fs_resample.",
+        description=(
+            "Resampling frequency for RR series (Hz). "
+            "Defaults to settings.hrv.fs_resample (2.0 Hz, aligned with VMD/VMDon)."
+        ),
     ),
 ) -> Dict[str, Any]:
     """
-    Frekans-domeni HRV metrikleri (VLF/LF/HF bant güçleri, LF/HF oranı, PSD spektrumu).
+    Frekans-domeni HRV metrikleri:
+        - VLF / LF / HF band güçleri (ms²),
+        - LF/HF oranı,
+        - PSD spektrumu (freq, psd).
     """
     window_length_s = _resolve_window_s(window, window_s)
-    fs = float(fs_resample) if fs_resample is not None else float(settings.hrv.fs_resample)
+    fs_default = float(settings.hrv.fs_resample)
+    fs = float(fs_resample) if fs_resample is not None else fs_default
 
     logger.info(
         "GET /metrics/freq subject=%s window=%s window_s=%s fs_resample=%.3f -> window_length_s=%s",
@@ -229,7 +239,7 @@ def freq_metrics(
 
 
 # -------------------------------------------------------------------
-# Poincare / non-linear metrics endpoint
+# Poincaré / non-linear metrics endpoint
 # -------------------------------------------------------------------
 
 @app.get("/metrics/poincare")
@@ -245,12 +255,12 @@ def poincare_metrics(
     ),
     max_points: Optional[int] = Query(
         None,
-        description="Maximum number of RR points for the Poincare scatter.",
+        description="Maximum number of RR points for the Poincaré scatter.",
     ),
 ) -> Dict[str, Any]:
     """
-    Poincare tabanlı non-linear HRV metrikleri:
-        - SD1, SD2, SD1/SD2
+    Poincaré tabanlı non-linear HRV metrikleri:
+        - SD1, SD2, SD1/SD2 oranı
         - stress_index
         - scatter verisi (x, y)
     """
@@ -329,6 +339,7 @@ def hr_series_metrics(
 ) -> Dict[str, Any]:
     """
     HR time-series (kalp hızı) için zaman ve bpm değerlerini döndürür.
+    Basit versiyon; Dash tarafında /metrics/hr_timeseries kullanılması tercih edilir.
     """
     window_length_s = _resolve_window_s(window, window_s)
     logger.info(
@@ -375,18 +386,19 @@ def hr_timeseries(
     ),
 ) -> Dict[str, Any]:
     """
-    HR zaman serisini (t_sec, hr_bpm) döndürür, maksimum nokta sayısı sınırlanabilir.
+    HR zaman serisini (t_sec, hr_bpm) döndürür; maksimum nokta sayısı sınırlanabilir.
+    Dashboard tarafından kullanılan ana endpoint budur.
     """
     window_length_s = _resolve_window_s(window, window_s)
     mp = max_points if max_points is not None else settings.dashboard.max_hr_points
 
     logger.info(
-        "GET /metrics/hr_timeseries subject=%s window=%s window_s=%s max_points=%s -> window_length_s=%.3f",
+        "GET /metrics/hr_timeseries subject=%s window=%s window_s=%s max_points=%s -> window_length_s=%s",
         subject,
         window,
         window_s,
         mp,
-        float(window_length_s) if window_length_s is not None else -1.0,
+        window_length_s,
     )
 
     t_sec, hr_bpm = get_hr_timeseries(
@@ -409,23 +421,37 @@ def hr_timeseries(
 @app.get("/metrics/vmdon")
 def vmdon_metrics(
     subject: str = Query(..., description="Subject code, e.g. '000'"),
-    window_s: float | None = Query(
+    window: Optional[str] = Query(
         None,
-        description="Window length in seconds for local VMDON; if None, uses full buffer/recording.",
+        description="Named window: 'full' or 'last_5min'. If provided, overrides window_s.",
+    ),
+    window_s: Optional[float] = Query(
+        None,
+        description=(
+            "Window length in seconds for local VMDON decomposition. "
+            "If not provided, uses named window or full buffer/recording."
+        ),
     ),
 ) -> Dict[str, Any]:
     """
-    VMDON-based HF/LF/VLF/ULF components for the given subject/window.
-    Lokal Python VMDON algoritmasını kullanır (Spark değil).
+    VMDON-benzeri çevrimiçi ayrıştırma ile HF/LF/VLF/ULF bileşenlerini döndürür.
+
+    Bu endpoint, Python içindeki VMDon-like algoritmayı kullanır (sliding-window, 2 Hz HRV(t)).
+    AVMD Spark ile üretilen özetler için /metrics/avmd_bands kullanılmalıdır.
     """
-    if window_s is not None and window_s <= 0:
-        window_s = None
+    window_length_s = _resolve_window_s(window, window_s)
 
     data = get_vmdon_components(
         subject_code=subject,
-        window_length_s=window_s,
+        window_length_s=window_length_s,
     )
-    logger.info("GET /metrics/vmdon subject=%s window_s=%s", subject, window_s)
+    logger.info(
+        "GET /metrics/vmdon subject=%s window=%s window_s=%s -> window_length_s=%s",
+        subject,
+        window,
+        window_s,
+        window_length_s,
+    )
     return data
 
 
@@ -440,11 +466,11 @@ def avmd_bands_metrics(
     """
     Spark AVMD job'ının (hrv_vmd_spark.py) ürettiği band özetlerini döner.
 
-    Spark job'u:
-        python src/spark/hrv_vmd_spark.py --method avmd --max-minutes 30 \
+    Spark job'u (örnek):
+        python src/spark/hrv_vmd_spark.py --method avmd --max-minutes 30 \\
             --output data/processed/hrv_bands_avmd.parquet
 
-    Dash tarafında “AVMD (Spark)” seçildiğinde bu endpoint'e istek atabilirsin.
+    Dash tarafında “AVMD (Spark)” modu seçildiğinde bu endpoint'e istek atılabilir.
     """
     data = get_avmd_spark_bands(subject_code=subject)
     n_bands = len(data.get("bands", []))

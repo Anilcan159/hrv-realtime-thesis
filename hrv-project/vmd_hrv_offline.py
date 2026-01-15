@@ -340,8 +340,14 @@ def _sliding_component(signal: np.ndarray, fs: float, window_s: float, use_vmd: 
         else:
             comp_win = trend
 
-        acc[start:start + W] += comp_win
-        cnt[start:start + W] += 1.0
+        comp_win = np.asarray(comp_win, dtype=float)
+        L = min(W, comp_win.size)
+        if L <= 0:
+            continue
+
+        acc[start:start + L] += comp_win[:L]
+        cnt[start:start + L] += 1.0
+
 
     out = np.zeros(N, dtype=float)
     m = cnt > 0

@@ -47,6 +47,9 @@ class PathSettings:
     # python src/spark/hrv_vmd_spark.py --method avmd --max-minutes 30 --output data/processed/hrv_bands_avmd.parquet
     hrv_bands_avmd_path: Path = BASE_DIR / "data" / "processed" / "hrv_bands_avmd.parquet"
 
+    # service_hrv.py ile uyum için alias (aynı path'e işaret eder)
+    avmd_spark_parquet: Path = BASE_DIR / "data" / "processed" / "hrv_bands_avmd.parquet"
+
 
 @dataclass(frozen=True)
 class KafkaSettings:
@@ -78,15 +81,18 @@ class HRVSettings:
     max_gap_beats: int = 3
 
     # Bellekte tutulacak maksimum RR geçmişi (saniye)
-    rr_max_age_s: float = 10 * 60.0
+    rr_max_age_s: float = 30 * 60.0
 
-    # Frekans-domeni yeniden örnekleme frekansı (Hz)
-    fs_resample: float = 4.0
+    # Frekans-domeni ve VMD/VMDon için yeniden örnekleme frekansı (Hz)
+    # Offline script ile tutarlı olacak şekilde 2.0 Hz
+    fs_resample: float = 2.0
 
-    # Spektral band sınırları (Hz)
-    vlf_band: Tuple[float, float] = (0.0033, 0.04)
-    lf_band: Tuple[float, float] = (0.04, 0.15)
-    hf_band: Tuple[float, float] = (0.15, 0.40)
+    # Spektral band sınırları (Hz) – VMD/AVMD/VMDon ile hizalı
+    # ULF sadece decomposition tarafında kullanılıyor; dashboard spektral metrikleri VLF/LF/HF üzerinden.
+    ulf_band: Tuple[float, float] = (0.0, 0.0047)
+    vlf_band: Tuple[float, float] = (0.0047, 0.0300)
+    lf_band: Tuple[float, float] = (0.0300, 0.1400)
+    hf_band: Tuple[float, float] = (0.1100, 0.4000)
 
 
 @dataclass(frozen=True)
@@ -124,5 +130,3 @@ class AppSettings:
 
 # Tek global config objesi
 settings = AppSettings()
-
-
